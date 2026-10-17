@@ -19,6 +19,8 @@
 1. **命令行**：在 `android/` 目录执行 `gradlew assembleDebug`（Windows 用 `gradlew.bat assembleDebug`），首次运行会自动下载对应 Gradle。
 2. **Android Studio**：`File → Open` 选择本 `android/` 目录，Studio 会按 wrapper 自动同步并构建。
 
+不想自己构建的话，本目录已附编好的 debug 包 `AutoClicker.apk`，传到手机安装即可。
+
 产物在 `app/build/outputs/apk/`。发布前请配置签名：在 Android Studio 中 `Build → Generate Signed Bundle / APK`，或在 `app/build.gradle` 中添加自己的 `signingConfigs`。
 
 环境要求：compileSdk 34、minSdk 24（`dispatchGesture` 的最低系统要求）、targetSdk 34。
