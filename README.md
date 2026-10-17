@@ -43,10 +43,7 @@
 
 ### Windows 图形版
 
-全部源码与打包配置在 [`windows/`](windows/) 目录。获取成品二选一：
-
-1. 到 [Releases](releases) 下载打包好的压缩包，解压后双击 `AutoClicker.exe`；
-2. 或从源码打包（见下文「从源码打包」）。
+全部源码与打包配置在 [`windows/`](windows/dist) 目录。
 
 ### 命令行脚本版
 
