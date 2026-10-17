@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="120" alt="AutoClicker Logo">
+  <img src="windows/assets/logo.png" width="120" alt="AutoClicker Logo">
 </p>
 
 <h1 align="center">AutoClicker 连点器</h1>
@@ -17,9 +17,9 @@
 </p>
 
 <p align="center">
-  <img src="assets/shot_continuous.png" width="300" alt="连续点击页">
+  <img src="windows/assets/shot_continuous.png" width="300" alt="连续点击页">
   &nbsp;&nbsp;
-  <img src="assets/shot_macro.png" width="300" alt="宏回放页">
+  <img src="windows/assets/shot_macro.png" width="300" alt="宏回放页">
 </p>
 
 ## 功能特性
@@ -35,7 +35,7 @@
 
 | 版本 | 目录 | 形态 | 适用场景 |
 | ---- | ---- | ---- | -------- |
-| **Windows 图形版** | 仓库根目录 | PySide6 桌面应用，打包为免安装 exe | 日常使用，功能最全 |
+| **Windows 图形版** | [`windows/`](windows/) | PySide6 桌面应用，打包为免安装 exe | 日常使用，功能最全 |
 | **命令行脚本版** | [`script/`](script/README.md) | 纯 Python 单文件，无 GUI | 服务器/远程桌面/自动化脚本串联 |
 | **Android 版** | [`android/`](android/README.md) | Kotlin 无障碍服务 App 工程 | 手机端连点与宏回放，无需 root |
 
@@ -43,7 +43,7 @@
 
 ### Windows 图形版
 
-仓库根目录即 Windows 版全部源码与打包配置。获取成品二选一：
+全部源码与打包配置在 [`windows/`](windows/) 目录。获取成品二选一：
 
 1. 到 [Releases](releases) 下载打包好的压缩包，解压后双击 `AutoClicker.exe`；
 2. 或从源码打包（见下文「从源码打包」）。
@@ -93,21 +93,21 @@ conda create -n autoclicker python=3.10
 conda activate autoclicker
 pip install pyside6 pynput pyinstaller
 
+cd windows
 python -m PyInstaller --distpath dist AutoClicker.spec
 ```
 
-产物输出到 `dist/AutoClicker/`，整个文件夹即交付物，请勿拆散目录结构。
+产物输出到 `windows/dist/AutoClicker/`，整个文件夹即交付物，请勿拆散目录结构。
 
 ## 目录结构
 
 ```
 .
-├─ app.py / app.ico / icon.qrc / icon_rc.py   Windows 版源码与图标资源
-├─ AutoClicker.spec                           PyInstaller 打包配置
+├─ windows/                                   Windows 图形版（源码 / 图标 / 打包配置 / 截图）
 ├─ script/                                    命令行脚本版（纯 Python）
 ├─ android/                                   Android 无障碍服务 App 工程（Kotlin）
-├─ assets/                                    Logo 与界面截图
-└─ LICENSE                                    MIT 开源协议
+├─ LICENSE                                    MIT 开源协议
+└─ README.md                                  本文件
 ```
 
 ## 开源协议
