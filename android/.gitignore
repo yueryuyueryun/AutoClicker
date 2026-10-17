@@ -1,0 +1,10 @@
+# Gradle / 构建产物不入库，仓库根级不提交 wrapper jar
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/

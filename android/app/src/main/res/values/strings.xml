@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AutoClicker</string>
+    <string name="accessibility_service_description">AutoClicker 连点器：通过无障碍服务在屏幕上注入点击手势，实现连续点击与宏录制回放。本服务不读取任何窗口内容。</string>
+</resources>

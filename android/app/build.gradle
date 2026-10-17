@@ -1,0 +1,39 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.yueryuyueryun.autoclicker'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.yueryuyueryun.autoclicker"
+        // dispatchGesture 从 API 24 起可用，因此最低支持 24
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+}
+
+dependencies {
+    // 保持最小依赖：界面全部代码构建，不需要 appcompat
+    implementation 'androidx.core:core-ktx:1.12.0'
+}

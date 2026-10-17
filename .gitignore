@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+build/
+dist/
+macros.json
+settings.json
+_*.py
+_*.png
