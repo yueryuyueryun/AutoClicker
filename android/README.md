@@ -14,10 +14,10 @@
 
 ## 构建步骤
 
-本目录**不提交 gradle wrapper 的二进制 jar**，请用以下任一方式构建（需要 Gradle 8.x，AGP 8.1 + Kotlin 1.9）：
+本目录自带 Gradle Wrapper（Gradle 8.7，AGP 8.1 + Kotlin 1.9，需 JDK 17）：
 
-1. **Android Studio（推荐）**：`File → Open` 选择本 `android/` 目录，Studio 会使用自带的 Gradle 自动同步并构建。
-2. **本地 Gradle 8.x**：在 `android/` 目录执行 `gradle assembleDebug`（或 `assembleRelease`）。
+1. **命令行**：在 `android/` 目录执行 `gradlew assembleDebug`（Windows 用 `gradlew.bat assembleDebug`），首次运行会自动下载对应 Gradle。
+2. **Android Studio**：`File → Open` 选择本 `android/` 目录，Studio 会按 wrapper 自动同步并构建。
 
 产物在 `app/build/outputs/apk/`。发布前请配置签名：在 Android Studio 中 `Build → Generate Signed Bundle / APK`，或在 `app/build.gradle` 中添加自己的 `signingConfigs`。
 
