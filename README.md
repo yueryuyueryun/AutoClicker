@@ -35,7 +35,7 @@
 
 | 版本 | 目录 | 形态 | 适用场景 |
 | ---- | ---- | ---- | -------- |
-| **Windows 图形版** | [`windows/`](windows/) | PySide6 桌面应用，打包为免安装 exe | 日常使用，功能最全 |
+| **Windows 图形版** | [`windows/`](windows/dist) | PySide6 桌面应用，打包为免安装 exe | 日常使用，功能最全 |
 | **命令行脚本版** | [`script/`](script/README.md) | 纯 Python 单文件，无 GUI | 服务器/远程桌面/自动化脚本串联 |
 | **Android 版** | [`android/`](android/README.md) | Kotlin 无障碍服务 App 工程 | 手机端连点与宏回放，无需 root |
 
@@ -43,10 +43,9 @@
 
 ### Windows 图形版
 
-全部源码与打包配置在 [`windows/`](windows/) 目录。获取成品二选一：
+全部源码与打包配置在 [`windows/`](windows/dist) 目录。获取成品二选一：
 
-1. 到 [Releases](releases) 下载打包好的压缩包，解压后双击 `AutoClicker.exe`；
-2. 或从源码打包（见下文「从源码打包」）。
+1. 到 [dist/]下打包好的压缩包，解压后双击 `AutoClicker.exe`；
 
 ### 命令行脚本版
 
