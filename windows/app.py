@@ -14,6 +14,7 @@ import shutil
 import ctypes
 from ctypes import wintypes
 from threading import Thread, Event
+from collections import deque
 
 from PySide6.QtCore import (
     Qt, Signal, QTimer, QEvent, QPoint, QPointF, QRect, QSize,
@@ -666,7 +667,6 @@ class AboutDialog(QDialog):
 
 class MainWindow(QWidget):
     sig_finished = Signal()
-    sig_record_click = Signal(int, int, object, bool)
 
     def __init__(self):
         super().__init__()
@@ -692,7 +692,11 @@ class MainWindow(QWidget):
         self._saved_geo = None
         self.stop_event = Event()
         self.worker = None
-        self.record_listener = None
+        self.record_thread = None
+        self._record_queue = deque()
+        self._record_drain = QTimer(self)
+        self._record_drain.setInterval(30)
+        self._record_drain.timeout.connect(self._drain_record_queue)
         self._last_record_t = None
         self._drag_pos = None
         self._closing = False
@@ -713,7 +717,6 @@ class MainWindow(QWidget):
         self._init_animations()
 
         self.sig_finished.connect(self._on_finished)
-        self.sig_record_click.connect(self._handle_record_click)
 
     # ---------------- UI ----------------
     def _init_ui(self):
@@ -1378,26 +1381,29 @@ class MainWindow(QWidget):
             # 新录制只保留本次动作，否则会把当前存档的旧行一起录进去
             self.step_table.setRowCount(0)
             self._last_record_t = None
-            self.record_listener = mouse.Listener(on_click=self._emit_record_click)
-            self.record_listener.start()
-            # 钩子线程起不来时静默失败会表现为"点了没反应、始终零步"，这里直接报错
-            time.sleep(0.12)
-            if not self.record_listener.is_alive():
-                self.record_listener = None
+            # 游戏全屏/提权窗口常使鼠标低级钩子被系统摘除，改轮询全局输入状态，录制更稳
+            self.record_thread = Thread(target=self._record_poll_loop, daemon=True)
+            self.record_thread.start()
+            time.sleep(0.05)
+            if not self.record_thread.is_alive():
+                self.record_thread = None
                 self.recording = False
                 QMessageBox.warning(self, "录制失败",
                                     "鼠标监听服务启动失败，请重试。")
                 return
+            self._record_drain.start()
             self.record_btn.setProperty("recording", True)
             repolish(self.record_btn)
             self.record_btn.setText("停止录制")
             self._enter_compact("record")
         else:
-            hook_alive = self.record_listener.is_alive() \
-                if self.record_listener else False
-            if self.record_listener is not None:
-                self.record_listener.stop()
-                self.record_listener = None
+            hook_alive = self.record_thread.is_alive() \
+                if self.record_thread else False
+            if self.record_thread is not None:
+                self.record_thread.join(timeout=0.5)
+                self.record_thread = None
+            self._record_drain.stop()
+            self._drain_record_queue()
             self.record_btn.setProperty("recording", False)
             repolish(self.record_btn)
             self.record_btn.setText("开始录制")
@@ -1424,17 +1430,40 @@ class MainWindow(QWidget):
                 else:
                     self._prompt_save_slot()
 
-    def _emit_record_click(self, x, y, button, pressed):
-        self.sig_record_click.emit(x, y, button, pressed)
+    # 轮询全局鼠标状态录制触点：低级钩子在游戏全屏/提权窗口下会被系统摘除，
+    # 而 GetAsyncKeyState 读的是全局输入状态，不受钩子失效与完整性级别影响。
+    # 轮询线程只做无锁入队，跨线程 Qt 信号无法投递，改由主线程 QTimer 排空队列。
+    def _record_poll_loop(self):
+        user32 = ctypes.windll.user32
+        vks = ((mouse.Button.left, 0x01),
+               (mouse.Button.right, 0x02),
+               (mouse.Button.middle, 0x04))
+        prev = {vk: False for _, vk in vks}
+        pt = wintypes.POINT()
+        while self.recording:
+            for btn, vk in vks:
+                down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
+                if down != prev[vk]:
+                    prev[vk] = down
+                    if user32.GetCursorPos(ctypes.byref(pt)):
+                        self._record_queue.append(
+                            (pt.x, pt.y, btn, down, time.perf_counter()))
+            time.sleep(0.004)
 
-    def _handle_record_click(self, x, y, button, pressed):
-        if not pressed or not self.recording:
+    def _drain_record_queue(self):
+        while self._record_queue:
+            x, y, button, pressed, t = self._record_queue.popleft()
+            self._handle_record_click(x, y, button, pressed, now=t)
+
+    def _handle_record_click(self, x, y, button, pressed, now=None):
+        if not pressed:
             return
         dpr = self.devicePixelRatioF() or 1.0
         x, y = round(x / dpr), round(y / dpr)
         if self.frameGeometry().contains(QPoint(x, y)):
             return
-        now = time.perf_counter()
+        if now is None:
+            now = time.perf_counter()
         table = self.step_table
         last = table.rowCount() - 1
         # 每次点击独立成行并记录与上一次点击的真实间隔，回放才能复现节奏
@@ -1930,8 +1959,10 @@ class MainWindow(QWidget):
     def _on_fade_out_finished(self):
         self._closing = True
         self.stop_event.set()
-        if self.record_listener is not None:
-            self.record_listener.stop()
+        self.recording = False
+        if self.record_thread is not None:
+            self.record_thread.join(timeout=0.5)
+            self.record_thread = None
         self.close()
         QApplication.quit()
 
