@@ -128,6 +128,16 @@ _user32.GetRawInputData.argtypes = [wintypes.HANDLE, wintypes.UINT,
                                     ctypes.c_void_p,
                                     ctypes.POINTER(wintypes.UINT), wintypes.UINT]
 _user32.GetRawInputData.restype = wintypes.UINT
+_user32.GetForegroundWindow.argtypes = []
+_user32.GetForegroundWindow.restype = wintypes.HWND
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                             ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR,
+                                  ctypes.c_int]
+_user32.GetClassNameW.restype = ctypes.c_int
+_user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+_user32.SetCursorPos.restype = wintypes.BOOL
 
 
 def cursor_pos():
@@ -177,6 +187,102 @@ def _selftest_click(x, y):
     _user32.mouse_event(0x0002, 0, 0, 0, 0)      # MOUSEEVENTF_LEFTDOWN
     time.sleep(0.05)
     _user32.mouse_event(0x0004, 0, 0, 0, 0)      # MOUSEEVENTF_LEFTUP
+
+
+# ---------------- 权限/进程审计：定位“被 UIPI 掐掉”的录制失败 ----------------
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD)]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+_advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                       ctypes.POINTER(wintypes.HANDLE)]
+_advapi32.OpenProcessToken.restype = wintypes.BOOL
+_advapi32.GetTokenInformation.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD)]
+_advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+TOKEN_QUERY = 0x0008
+TOKEN_ELEVATION_CLASS = 20
+
+
+class _TOKEN_ELEVATION(ctypes.Structure):
+    _fields_ = [("TokenIsElevated", wintypes.DWORD)]
+
+
+def is_elevated(pid=0):
+    """进程是否以管理员（高完整性）运行；取不到返回 None。"""
+    if pid:
+        handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                       False, int(pid))
+        if not handle:
+            return None
+        owned = True
+    else:
+        handle = _kernel32.GetCurrentProcess()
+        owned = False
+    try:
+        token = wintypes.HANDLE()
+        if not _advapi32.OpenProcessToken(handle, TOKEN_QUERY,
+                                          ctypes.byref(token)):
+            return None
+        try:
+            info = _TOKEN_ELEVATION()
+            size = wintypes.DWORD()
+            if not _advapi32.GetTokenInformation(
+                    token, TOKEN_ELEVATION_CLASS, ctypes.byref(info),
+                    ctypes.sizeof(info), ctypes.byref(size)):
+                return None
+            return bool(info.TokenIsElevated)
+        finally:
+            _kernel32.CloseHandle(token)
+    finally:
+        if owned:
+            _kernel32.CloseHandle(handle)
+
+
+def process_path(pid):
+    """进程可执行文件路径；取不到返回空串。"""
+    if not pid:
+        return ""
+    handle = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                                   int(pid))
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(1024)
+        size = wintypes.DWORD(len(buf))
+        if not _kernel32.QueryFullProcessImageNameW(handle, 0, buf,
+                                                    ctypes.byref(size)):
+            return ""
+        return buf.value
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
+def foreground_info():
+    """前台窗口审计：类名/进程/路径/是否提权，用来解释录制为什么收不到事件。"""
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return {"hwnd": 0, "class": "", "pid": 0, "path": "", "elevated": None}
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    path = process_path(pid.value)
+    return {"hwnd": int(hwnd), "class": _window_class(hwnd),
+            "pid": int(pid.value), "path": path,
+            "elevated": is_elevated(pid.value)}
+
+
+def _short_exe(path):
+    return os.path.basename(path) if path else "未知进程"
 
 
 
@@ -706,7 +812,7 @@ class PromptDialog(QDialog):
 class AboutDialog(QDialog):
     """关于卡片：Logo、版本、作者署名与开源地址。"""
 
-    VERSION = "1.1.0"
+    VERSION = "1.1.1"
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -822,6 +928,9 @@ class MouseCapture:
         self.raw_ok = False
         self.counts = {"hook": 0, "poll": 0, "raw": 0}
         self.errors = []
+        self.dead = {}                # channel -> 死因（线程崩了/钩子被摘）
+        self.last_event = {}          # channel -> 最近一次事件时间
+        self.trace = deque(maxlen=2000)   # 诊断日志行，导出给用户排查用
         self._lock = Lock()
         self._stop = Event()
         self._poll_thread = None
@@ -829,6 +938,15 @@ class MouseCapture:
         self._hook_proc = None
         self._last_press = {}
         self._running = False
+
+    def trace_line(self, text):
+        stamp = time.strftime("%H:%M:%S")
+        with self._lock:
+            self.trace.append(f"{stamp} {text}")
+
+    def dump_trace(self):
+        with self._lock:
+            return list(self.trace)
 
     # ---- 生命周期 ----
     def start(self):
@@ -869,8 +987,13 @@ class MouseCapture:
     def summary(self):
         labels = (("hook", "钩子"), ("poll", "轮询"), ("raw", "原始输入"))
         with self._lock:
-            return " / ".join(f"{name} {self.counts.get(key, 0)}"
-                              for key, name in labels)
+            parts = []
+            for key, name in labels:
+                if key in self.dead:
+                    parts.append(f"{name} 已断开")
+                else:
+                    parts.append(f"{name} {self.counts.get(key, 0)}")
+            return " / ".join(parts)
 
     # ---- 通道 A：低级鼠标钩子（挂在主线程消息循环上，无需自建泵）----
     def _install_hook(self):
@@ -913,15 +1036,20 @@ class MouseCapture:
         vks = ((mouse.Button.left, 0x01), (mouse.Button.right, 0x02),
                (mouse.Button.middle, 0x04))
         prev = {vk: False for _, vk in vks}
-        while not self._stop.is_set():
-            for btn, vk in vks:
-                down = bool(_user32.GetAsyncKeyState(vk) & 0x8000)
-                if down != prev[vk]:
-                    prev[vk] = down
-                    pos = cursor_pos()
-                    if pos is not None:
-                        self._emit(pos[0], pos[1], btn, down, "poll")
-            self._stop.wait(0.004)
+        try:
+            while not self._stop.is_set():
+                for btn, vk in vks:
+                    down = bool(_user32.GetAsyncKeyState(vk) & 0x8000)
+                    if down != prev[vk]:
+                        prev[vk] = down
+                        pos = cursor_pos()
+                        if pos is not None:
+                            self._emit(pos[0], pos[1], btn, down, "poll")
+                self._stop.wait(0.004)
+        except BaseException as exc:      # 线程静默死掉是录制失败最难查的一种
+            with self._lock:
+                self.dead["poll"] = repr(exc)
+            self.trace_line(f"轮询线程异常退出：{exc!r}")
 
     # ---- 通道 C：原始输入（WM_INPUT，主线程 nativeEvent 喂进来）----
     def feed_raw(self, button_flags):
@@ -938,8 +1066,11 @@ class MouseCapture:
         if not self._running:
             return
         now = time.perf_counter()
+        first = False
         with self._lock:
+            first = channel not in self.last_event
             self.counts[channel] = self.counts.get(channel, 0) + 1
+            self.last_event[channel] = now
             dup = False
             if pressed:
                 last = self._last_press.get(button)
@@ -947,12 +1078,14 @@ class MouseCapture:
                     dup = True
                 else:
                     self._last_press[button] = now
+        if first:
+            self.trace_line(f"通道 {channel} 收到首个事件 ({x},{y})")
         if dup:
             return
         try:
             self.on_event(int(x), int(y), button, bool(pressed), now, channel)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.trace_line(f"事件回调异常：{exc!r}")
 
 
 class MainWindow(QWidget):
@@ -993,6 +1126,12 @@ class MainWindow(QWidget):
         self._own_hwnds_cache = set()
         self._raw_registered = False
         self._raw_hwnd = 0
+        # 录制诊断：默认每秒落一行快照，用户报障时把 diag-*.log 发来即可定位
+        self._diag = "--no-diag" not in sys.argv
+        self._diag_path = ""
+        self._diag_last = 0.0
+        self._uipi_warned = False
+        self._uipi_last = 0.0
         self._drag_pos = None
         self._closing = False
         self._minimizing = False
@@ -1697,6 +1836,9 @@ class MainWindow(QWidget):
         self._record_t0 = time.perf_counter()
         self._record_queue.clear()
         self.recording = True
+        self._uipi_warned = False
+        self._uipi_last = 0.0
+        self._diag_last = 0.0
         self._capture = MouseCapture(self._on_capture_event)
         self._capture.start()
         self._register_raw_input()      # 先把第三路挂上，再判定是否全灭
@@ -1709,12 +1851,18 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "录制失败",
                                 f"鼠标监听服务启动失败（{detail}），请重试。")
             return
+        self._diag_open()
+        self._diag_write("=== 开始录制 ===")
+        self._diag_write(f"本程序 版本 {AboutDialog.VERSION} "
+                         f"提权={is_elevated()} 冻结={getattr(sys, 'frozen', False)}")
+        self._diag_write("启动时前台：" + self._audit_text(foreground_info()))
+        self._diag_write("通道初始：" + self._capture.summary())
         self._record_drain.start()
         self.record_btn.setProperty("recording", True)
         repolish(self.record_btn)
         self.record_btn.setText("停止录制")
         self.pill_count.setText("● 已录制 0 步")
-        self.pill_hint.setText("点游戏画面即可录制")
+        self.pill_hint.setText(f"v{AboutDialog.VERSION} · 点游戏画面即可录制")
         self._own_hwnds_cache = self._own_hwnds()
         self._enter_compact("record")
         # 必须等紧凑模式切换完再注册：setWindowFlags 可能重建原生窗口
@@ -1726,6 +1874,11 @@ class MainWindow(QWidget):
         self._unregister_raw_input()
         self._record_drain.stop()
         self._drain_record_queue()
+        self._diag_write("=== 停止录制 ===")
+        self._diag_write(f"通道汇总：{self._capture.summary()} 步数={self.step_table.rowCount()}")
+        for line in self._capture.dump_trace()[-200:]:
+            self._diag_write("  " + line)
+        self._diag_write("收尾时前台：" + self._audit_text(foreground_info()))
         self.record_btn.setProperty("recording", False)
         repolish(self.record_btn)
         self.record_btn.setText("开始录制")
@@ -1754,17 +1907,30 @@ class MainWindow(QWidget):
     def _recording_empty_dialog(self):
         """零步收尾：说清哪条采集通道没抓到，并给出可执行的下一步。"""
         stats = self._capture.summary()
+        fg = foreground_info()
+        mine = is_elevated()
+        if fg["pid"] and fg["pid"] != os.getpid() and fg["elevated"] and mine is False:
+            head = ("前台窗口 %s 以管理员权限运行，Windows 会掐掉普通权限程序的鼠标钩子。\n"
+                    "本程序需要同样以管理员身份重开，勾选后会自动重启。\n\n"
+                    % _short_exe(fg["path"]))
+        else:
+            head = ""
         if self._capture.total_events() == 0:
             message = (
-                "这次一个鼠标点击都没收到（采集通道：%s）。\n\n"
+                "%s这次一个鼠标点击都没收到（采集通道：%s）。\n"
+                "录制结束时前台窗口：%s\n\n"
                 "请依次排查：\n"
                 "1. 点「停止录制」之外的游戏画面再试，别点在悬浮条上；\n"
-                "2. 游戏若以管理员身份运行，本程序也用管理员身份重开再录；\n"
-                "3. 全屏独占游戏先切「窗口化 / 无边框窗口」再录。" % stats)
+                "2. 游戏若以管理员身份运行（用启动器/平台启动常见），本程序也用管理员身份重开；\n"
+                "3. 全屏独占游戏先切「窗口化 / 无边框窗口」再录。"
+                % (head, stats, self._audit_text(fg)))
         else:
             message = (
-                "收到的点击都落在本程序自己的窗口上（采集通道：%s）。\n\n"
-                "录制时请点游戏画面，不要点悬浮条和面板按钮。" % stats)
+                "%s收到的点击都落在本程序自己的窗口上（采集通道：%s）。\n\n"
+                "录制时请点游戏画面，不要点悬浮条和面板按钮。"
+                % (head, stats))
+        if self._diag_path:
+            message += "\n\n诊断日志：%s" % self._diag_path
         dlg = PromptDialog(self, "没有录到点击", message, prompt=False,
                            confirm_text="以管理员身份重启")
         if dlg.popup() == QDialog.Accepted:
@@ -1797,10 +1963,15 @@ class MainWindow(QWidget):
     def _drain_record_queue(self):
         while self._record_queue:
             x, y, button, pressed, t = self._record_queue.popleft()
-            self._handle_record_click(x, y, button, pressed, now=t)
+            try:
+                self._handle_record_click(x, y, button, pressed, now=t)
+            except Exception as exc:      # 冻结包无控制台，异常会彻底静默
+                self._diag_write(f"落行异常：{exc!r}")
         # 紧凑切换/置顶可能重建原生窗口，导致原始输入的 HWND 失效
         if self.recording:
             self._register_raw_input()
+            self._uipi_check()
+            self._diag_sample()
         self._refresh_record_hint()
 
     def _refresh_record_hint(self):
@@ -1810,8 +1981,99 @@ class MainWindow(QWidget):
         self.pill_count.setText(f"● 已录制 {rows} 步")
         if rows:
             self.pill_hint.setText("已记录，点右侧按钮结束")
-        elif time.perf_counter() - self._record_t0 > 3.0:
-            self.pill_hint.setText("还没录到点击，点游戏画面试试")
+            return
+        elapsed = time.perf_counter() - self._record_t0
+        if elapsed <= 1.5:
+            return
+        counts = self._capture.counts
+        dead = self._capture.dead
+        if dead:
+            self.pill_hint.setText(
+                f"采集通道断开（{self._capture.summary()}），点停止看诊断")
+        else:
+            # 实时显示三路通道各收到多少事件：全是 0 说明系统没把点击送过来
+            self.pill_hint.setText(
+                f"未收到点击 · 钩子{counts.get('hook', 0)} "
+                f"轮询{counts.get('poll', 0)} 原始{counts.get('raw', 0)}")
+
+    # ---- 诊断：UIPI 权限审计 + 日志落盘 ----
+    def _audit_text(self, info):
+        if not info["pid"]:
+            return "取不到前台窗口"
+        flag = {True: "已提权", False: "普通权限", None: "权限未知"}[info["elevated"]]
+        return "%s（%s, pid=%s, %s）" % (
+            _short_exe(info["path"]), info["class"] or "?", info["pid"], flag)
+
+    def _uipi_check(self):
+        """前台窗口比本程序权限高时，Windows 会摘掉鼠标钩子——当场提醒。"""
+        now = time.perf_counter()
+        if self._uipi_warned or now - self._uipi_last < 0.5:
+            return
+        self._uipi_last = now
+        info = foreground_info()
+        if not info["pid"] or info["pid"] == os.getpid():
+            return
+        if info["elevated"] and is_elevated() is False:
+            self._uipi_warned = True
+            self._diag_write("检测到 UIPI：" + self._audit_text(info))
+            self.pill_hint.setText("游戏权限更高，可能录不到点击")
+            # 不在定时器回调里开模态框：排到事件循环下一轮
+            QTimer.singleShot(0, lambda: self._show_uipi_dialog(info))
+
+    def _show_uipi_dialog(self, info):
+        dlg = PromptDialog(
+            self, "游戏权限更高",
+            "前台窗口 %s 以管理员权限运行，Windows 会屏蔽本程序的鼠标钩子，"
+            "点击多半录不到。\n\n要以管理员身份重新启动本程序吗？"
+            "（会先结束当前录制）" % _short_exe(info["path"]),
+            prompt=False, confirm_text="以管理员身份重启")
+        if dlg.popup() == QDialog.Accepted:
+            self._stop_recording(ask_save=False)
+            self._restart_as_admin()
+
+    def _diag_open(self):
+        if not self._diag or self._diag_path:
+            return
+        try:
+            base = self._data_base()
+            os.makedirs(base, exist_ok=True)
+            self._diag_path = os.path.join(
+                base, time.strftime("diag-%Y%m%d-%H%M%S.log"))
+            self._diag_write("AutoClicker 录制诊断 " + AboutDialog.VERSION)
+        except OSError:
+            self._diag_path = ""
+
+    def _diag_write(self, text):
+        if not self._diag or not self._diag_path:
+            return
+        try:
+            with open(self._diag_path, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+        except OSError:
+            pass
+
+    def _diag_sample(self):
+        """录制中每秒落一行现场快照，远程排查时最有用。"""
+        if not self._diag:
+            return
+        now = time.perf_counter()
+        if now - self._diag_last < 1.0:
+            return
+        self._diag_last = now
+        pos = cursor_pos()
+        thread = self._capture._poll_thread
+        alive = bool(thread is not None and thread.is_alive())
+        keys = "".join(
+            name for name, vk in (("左", 0x01), ("右", 0x02), ("中", 0x04))
+            if _user32.GetAsyncKeyState(vk) & 0x8000) or "无"
+        self._diag_write(
+            "t=%4.1fs 步=%d 通道[%s] 轮询线程=%s 按键=%s 光标=%s 前台=%s "
+            "原始输入=%s 本窗口数=%d" % (
+                now - self._record_t0, self.step_table.rowCount(),
+                self._capture.summary(), "活" if alive else "死", keys, pos,
+                self._audit_text(foreground_info()),
+                self._raw_registered, len(self._own_hwnds_cache)))
+
 
     def _handle_record_click(self, x, y, button, pressed, now=None):
         if not pressed:
