@@ -36,6 +36,13 @@ class OverlayController(
 
     private var pickView: View? = null
     private var recordView: View? = null
+    private var recordParams: WindowManager.LayoutParams? = null
+
+    // 录制捕获层的基础窗口标志；穿透转发时临时叠加 FLAG_NOT_TOUCHABLE
+    private val recordBaseFlags =
+        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
     private var loopEdit: TextView? = null
     private var loopUnit: TextView? = null
@@ -57,6 +64,25 @@ class OverlayController(
         barView = bar
         barParams = params
         wm.addView(bar, params)
+        // 布局完成后把胶囊条夹回屏幕安全区，任何分辨率都不出界
+        bar.post { clampBar() }
+    }
+
+    private fun clampBar() {
+        val bar = barView ?: return
+        val params = barParams ?: return
+        val mw = service.resources.displayMetrics.widthPixels
+        val mh = service.resources.displayMetrics.heightPixels
+        val mgn = dp(service, 12f)
+        barX = barX.coerceIn(mgn, (mw - mgn - bar.width).coerceAtLeast(mgn))
+        barY = barY.coerceIn(mgn, (mh - mgn - bar.height).coerceAtLeast(mgn))
+        params.x = barX
+        params.y = barY
+        try {
+            wm.updateViewLayout(bar, params)
+        } catch (e: IllegalArgumentException) {
+            // 视图可能已被系统移除
+        }
     }
 
     fun hideBar() {
@@ -85,36 +111,36 @@ class OverlayController(
     private fun buildExecPill(): View {
         val ctx = service
         val root = pillRoot(ctx)
-        root.addView(pillButton(ctx, "终止执行", danger = true) { service.stop() })
+        root.addView(pillButton(ctx, "终止执行", danger = true) { service.stop() }.compact())
         root.addView(ghostButton(ctx, "返回应用") {
             hideBar()
             openApp()
-        }.apply { margin() })
-        root.addView(pillButton(ctx, "再执行一次") { service.start() }.apply { margin() })
+        }.compact().apply { margin() })
+        root.addView(pillButton(ctx, "再执行一次") { service.start() }.compact().apply { margin() })
         root.addView(View(ctx), LinearLayout.LayoutParams(0, 1, 1f))
 
         val frame = LinearLayout(ctx).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = solid(ctx, Theme.pal.field, 9f, Theme.pal.fieldBorder)
-            setPadding(dp(ctx, 10f), 0, dp(ctx, 10f), 0)
+            setPadding(dp(ctx, 6f), 0, dp(ctx, 6f), 0)
         }
         // 悬浮胶囊条为 NOT_FOCUSABLE，无法弹出输入法，故此处只读展示次数；
         // 次数的编辑入口在主界面「循环次数」行，两处数值经回调保持一致
         loopEdit = TextView(ctx).apply {
             text = service.loops.toString()
-            textSize = 13f
+            textSize = 12f
             setTextColor(Theme.pal.fieldText)
             gravity = Gravity.CENTER_VERTICAL or Gravity.END
             background = solid(ctx, Theme.pal.listBg, 7f, Theme.pal.fieldBorder)
-            setPadding(dp(ctx, 6f), dp(ctx, 4f), dp(ctx, 6f), dp(ctx, 4f))
+            setPadding(dp(ctx, 5f), 0, dp(ctx, 5f), 0)
         }
-        frame.addView(loopEdit, dp(ctx, 52f), dp(ctx, 26f))
+        frame.addView(loopEdit, dp(ctx, 40f), dp(ctx, 22f))
         loopUnit = TextView(ctx).apply {
             text = if (service.loops == 0) "无限" else "次"
-            textSize = 12f
+            textSize = 11f
             setTextColor(Theme.pal.dim)
-            setPadding(dp(ctx, 5f), 0, 0, 0)
+            setPadding(dp(ctx, 4f), 0, 0, 0)
         }
         frame.addView(loopUnit)
         root.addView(frame)
@@ -124,8 +150,15 @@ class OverlayController(
     private fun buildRecordPill(): View {
         val ctx = service
         val root = pillRoot(ctx)
-        root.addView(pillButton(ctx, "停止录制", danger = true) { service.stopRecording() })
+        root.addView(pillButton(ctx, "停止录制", danger = true) { service.stopRecording() }.compact())
         return root
+    }
+
+    // 胶囊条按安卓惯例做屏幕适配：字号/内边距收紧，保证 360dp 宽的屏幕也放得下
+    private fun TextView.compact(): TextView {
+        textSize = 12f
+        setPadding(dp(service, 10f), dp(service, 7f), dp(service, 10f), dp(service, 7f))
+        return this
     }
 
     private fun pillRoot(ctx: Context): LinearLayout {
@@ -134,7 +167,7 @@ class OverlayController(
             gravity = Gravity.CENTER_VERTICAL
             background = solid(ctx, Theme.pal.card, 16f, Theme.pal.cardBorder)
             elevation = dp(ctx, 8f).toFloat()
-            setPadding(dp(ctx, 8f), dp(ctx, 6f), dp(ctx, 10f), dp(ctx, 6f))
+            setPadding(dp(ctx, 6f), dp(ctx, 6f), dp(ctx, 8f), dp(ctx, 6f))
         }
         // 空白处按下即拖动整条，按钮各自消费点击
         root.setOnTouchListener(BarDragListener())
@@ -142,13 +175,13 @@ class OverlayController(
     }
 
     private fun View.margin() {
-        (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(service, 6f)
+        (layoutParams as? LinearLayout.LayoutParams)?.leftMargin = dp(service, 4f)
         if (layoutParams == null) {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { leftMargin = dp(service, 6f) }
+            ).apply { leftMargin = dp(service, 4f) }
         } else {
-            (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(service, 6f)
+            (layoutParams as LinearLayout.LayoutParams).leftMargin = dp(service, 4f)
         }
     }
 
@@ -176,11 +209,8 @@ class OverlayController(
                 MotionEvent.ACTION_MOVE -> {
                     barX = originX + (event.rawX - downRawX).toInt()
                     barY = originY + (event.rawY - downRawY).toInt()
-                    val view = barView ?: return false
-                    val params = barParams ?: return false
-                    params.x = barX
-                    params.y = barY
-                    wm.updateViewLayout(view, params)
+                    if (barView == null) return false
+                    clampBar()
                     return true
                 }
             }
@@ -274,16 +304,23 @@ class OverlayController(
                 Gravity.TOP or Gravity.CENTER_HORIZONTAL
             ).apply { topMargin = dp(ctx, 72f) }
         )
+        // 记录触点后把这次点击原样穿透给下层应用，被点页面产生真实反馈
         root.setOnTouchListener { _, ev ->
             if (ev.action == MotionEvent.ACTION_DOWN) {
-                service.onRecordTouch(ev.rawX.toInt(), ev.rawY.toInt())
-                true
-            } else {
-                false
+                // 注入手势回落到本层时只消费不记录，避免重复计步
+                if (!forwarding) {
+                    val x = ev.rawX.toInt()
+                    val y = ev.rawY.toInt()
+                    service.onRecordTouch(x, y)
+                    forwardTap(x, y)
+                }
             }
+            true
         }
         recordView = root
-        wm.addView(root, fullScreenParams())
+        val params = fullScreenParams()
+        recordParams = params
+        wm.addView(root, params)
         // 录制层盖住胶囊条，重挂一次把[停止录制]抬回最上层
         barView?.let { bar ->
             barParams?.let { p ->
@@ -293,9 +330,38 @@ class OverlayController(
         }
     }
 
+    private var forwarding = false
+
+    private fun forwardTap(x: Int, y: Int) {
+        if (forwarding) return
+        forwarding = true
+        setRecordTouchable(false)
+        // 等窗口标志生效后再注入，否则手势会被本层自己吃掉
+        recordView?.postDelayed({
+            service.injectTap(x, y) {
+                forwarding = false
+                setRecordTouchable(true)
+            }
+        }, 60)
+    }
+
+    private fun setRecordTouchable(touchable: Boolean) {
+        val v = recordView ?: return
+        val p = recordParams ?: return
+        p.flags = recordBaseFlags or
+                (if (touchable) 0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+        try {
+            wm.updateViewLayout(v, p)
+        } catch (e: IllegalArgumentException) {
+            // 视图可能已被系统移除
+        }
+    }
+
     fun hideRecordLayer() {
         recordView?.let { removeViewQuietly(it) }
         recordView = null
+        recordParams = null
+        forwarding = false
     }
 
     // ---------------- 工具 ----------------
@@ -305,9 +371,7 @@ class OverlayController(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            recordBaseFlags,
             PixelFormat.TRANSLUCENT
         ).apply { gravity = Gravity.TOP or Gravity.START }
 

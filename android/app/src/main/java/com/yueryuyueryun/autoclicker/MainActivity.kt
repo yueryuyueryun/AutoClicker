@@ -69,6 +69,7 @@ class MainActivity : Activity() {
             runOnUiThread { syncPick() }
         }
         ClickerService.onSettingsChanged = { runOnUiThread { syncLoopField() } }
+        ClickerService.onSlotsChanged = { runOnUiThread { refreshSlots() } }
         syncPermRow()
         syncStart()
         syncRecord()
@@ -82,6 +83,7 @@ class MainActivity : Activity() {
         ClickerService.onRecordingChanged = null
         ClickerService.onTargetPicked = null
         ClickerService.onSettingsChanged = null
+        ClickerService.onSlotsChanged = null
         super.onDestroy()
     }
 
@@ -338,8 +340,12 @@ class MainActivity : Activity() {
             setText(initial)
             gravity = Gravity.CENTER_VERTICAL or Gravity.END
             background = solid(this@MainActivity, Theme.pal.listBg, 7f, Theme.pal.fieldBorder)
+            // 去掉上下内边距并单行显示，输入框与外框等高居中、内容不再滚动
+            setPadding(dp(this@MainActivity, 10f), 0, dp(this@MainActivity, 10f), 0)
+            setSingleLine(true)
+            overScrollMode = View.OVER_SCROLL_NEVER
         }
-        frame.addView(edit, dp(this, 72f), dp(this, 28f))
+        frame.addView(edit, dp(this, 72f), dp(this, 32f))
         val unitLab = TextView(this).apply {
             text = unit
             textSize = 13f
@@ -355,7 +361,7 @@ class MainActivity : Activity() {
         edit.addTextChangedListener(afterChanged = { onChange(edit.text.toString(), edit) })
         return frame.apply {
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(this@MainActivity, 40f))
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(this@MainActivity, 44f))
         }
     }
 
@@ -553,11 +559,16 @@ class MainActivity : Activity() {
             toast("请先开启无障碍服务")
             return
         }
-        if (svc.recordedStepCount() == 0) {
-            toast("没有已录制的步骤，请先录制")
+        val recorded = svc.recordedStepCount()
+        val defaultName = "回放 ${MacroStore(this).names().size + 1}"
+        if (recorded == 0) {
+            // 与电脑版一致：任何时候都能先建空存档，选中后再录制写入
+            promptName(defaultName, "为新存档命名") { name ->
+                createEmptySlot(name)
+            }
             return
         }
-        promptName("") { name ->
+        promptName(defaultName, "为当前录制的 $recorded 步命名") { name ->
             val exists = MacroStore(this).names().contains(name)
             val doSave = {
                 if (svc.saveCurrentRecording(name)) {
@@ -569,6 +580,20 @@ class MainActivity : Activity() {
             if (exists) confirm("覆盖存档", "已存在同名存档「$name」，是否覆盖？", "覆盖") { doSave() }
             else doSave()
         }
+    }
+
+    private fun createEmptySlot(name: String) {
+        val svc = ClickerService.instance ?: return
+        val exists = MacroStore(this).names().contains(name)
+        val doCreate = {
+            MacroStore(this).save(MacroStore.Macro(name, emptyList(), svc.gapMs, svc.loops))
+            svc.selectMacro(name)
+            prefs.edit().putString("sel", name).apply()
+            refreshSlots()
+            toast("已创建存档[$name]，选中后点「开始录制」即可写入")
+        }
+        if (exists) confirm("覆盖存档", "已存在同名存档「$name」，将清空其步骤，是否覆盖？", "覆盖") { doCreate() }
+        else doCreate()
     }
 
     private fun deleteSlot() {
@@ -611,11 +636,11 @@ class MainActivity : Activity() {
         d.popup()
     }
 
-    private fun promptName(default: String, onOk: (String) -> Unit) {
+    private fun promptName(default: String, subtitle: String, onOk: (String) -> Unit) {
         val d = CardDialog(this)
         d.card.addView(dialogHead(d, "新建存档"))
         d.card.addView(TextView(this).apply {
-            text = "为当前录制的 ${ClickerService.instance?.recordedStepCount() ?: 0} 步命名"
+            text = subtitle
             textSize = 12f
             setTextColor(Theme.pal.dim)
         })

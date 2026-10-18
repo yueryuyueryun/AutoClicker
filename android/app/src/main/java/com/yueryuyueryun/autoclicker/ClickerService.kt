@@ -28,6 +28,7 @@ class ClickerService : AccessibilityService() {
         var onRecordingChanged: (() -> Unit)? = null
         var onSettingsChanged: (() -> Unit)? = null
         var onTargetPicked: ((Int, Int) -> Unit)? = null
+        var onSlotsChanged: (() -> Unit)? = null
     }
 
     enum class Mode { CONTINUOUS, MACRO }
@@ -260,11 +261,37 @@ class ClickerService : AccessibilityService() {
 
     fun stopRecording() {
         isRecording = false
+        val target = selectedMacro
         if (::overlay.isInitialized) {
             overlay.hideRecordLayer()
-            overlay.toast("已录制 ${recordedSteps.size} 步，可在「新建存档」中保存")
+            if (target != null && recordedSteps.isNotEmpty()) {
+                // 与电脑版一致：已选中存档时录制结果直接写回该存档
+                store.save(MacroStore.Macro(target.name, recordedSteps.toList(), target.gap, target.loops))
+                selectedMacro = store.find(target.name)
+                overlay.toast("已录制 ${recordedSteps.size} 步，写入存档「${target.name}」")
+                onSlotsChanged?.invoke()
+            } else {
+                overlay.toast("已录制 ${recordedSteps.size} 步，可在「新建存档」中保存")
+            }
         }
         onRecordingChanged?.invoke()
         if (::overlay.isInitialized) overlay.refreshState()
+        // 与电脑版 _exit_compact 一致：停止录制后主窗口自动回到前台
+        packageManager.getLaunchIntentForPackage(packageName)?.let {
+            it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                    android.content.Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+            startActivity(it)
+        }
+    }
+
+    // 录制穿透：把用户这次点击原样注入给下层应用，让被点页面产生真实反馈
+    fun injectTap(x: Int, y: Int, onDone: () -> Unit) {
+        val builder = GestureDescription.Builder()
+        val p = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+        builder.addStroke(GestureDescription.StrokeDescription(p, 0L, CLICK_DURATION_MS))
+        dispatchGesture(builder.build(), object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) { onDone() }
+            override fun onCancelled(gestureDescription: GestureDescription?) { onDone() }
+        }, handler)
     }
 }
