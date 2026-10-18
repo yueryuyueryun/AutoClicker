@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QComboBox, QVBoxLayout, QHBoxLayout, QButtonGroup,
     QGraphicsDropShadowEffect, QAbstractSpinBox, QLineEdit, QTableWidget,
     QTableWidgetItem,
-    QScrollArea, QDialog,
+    QScrollArea, QDialog, QMessageBox,
 )
 from pynput import mouse
 
@@ -1378,17 +1378,23 @@ class MainWindow(QWidget):
             # 新录制只保留本次动作，否则会把当前存档的旧行一起录进去
             self.step_table.setRowCount(0)
             self._last_record_t = None
-            if 0 <= self.slot_idx < len(self.slots):
-                # 开始录制即清空选中存档的旧动作，停止时自动写入新动作
-                self.slots[self.slot_idx]["steps"] = []
-                self._refresh_slot_list()
             self.record_listener = mouse.Listener(on_click=self._emit_record_click)
             self.record_listener.start()
+            # 钩子线程起不来时静默失败会表现为"点了没反应、始终零步"，这里直接报错
+            time.sleep(0.12)
+            if not self.record_listener.is_alive():
+                self.record_listener = None
+                self.recording = False
+                QMessageBox.warning(self, "录制失败",
+                                    "鼠标监听服务启动失败，请重试。")
+                return
             self.record_btn.setProperty("recording", True)
             repolish(self.record_btn)
             self.record_btn.setText("停止录制")
             self._enter_compact("record")
         else:
+            hook_alive = self.record_listener.is_alive() \
+                if self.record_listener else False
             if self.record_listener is not None:
                 self.record_listener.stop()
                 self.record_listener = None
@@ -1404,10 +1410,17 @@ class MainWindow(QWidget):
                         max(0.0, min(round(pause, 1), 600.0)))
                 idx = self.slot_idx
                 if 0 <= idx < len(self.slots):
-                    # 已选中存档：录制结果直接写入该存档
-                    self.slots[idx]["steps"] = self._steps_for_save()
-                    self._save_slots()
-                    self._refresh_slot_list()
+                    if self.step_table.rowCount() > 0:
+                        # 已选中存档：录制结果直接写入该存档
+                        self.slots[idx]["steps"] = self._steps_for_save()
+                        self._save_slots()
+                        self._refresh_slot_list()
+                    else:
+                        # 一个点击都没录到不清空旧存档，避免静默丢数据
+                        reason = "" if hook_alive else "（录制钩子中途失效）"
+                        QMessageBox.information(
+                            self, "录制结束",
+                            f"未录制到任何点击{reason}，存档内容保持不变。")
                 else:
                     self._prompt_save_slot()
 
