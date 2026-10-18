@@ -10,16 +10,24 @@ import android.os.SystemClock
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 
-// 无障碍服务：持有悬浮控制条，负责手势注入与点击/回放的调度
+// 无障碍服务：持有悬浮胶囊条，负责手势注入与点击/回放的调度
 class ClickerService : AccessibilityService() {
 
     companion object {
         // 单次点击手势时长，60ms 足够被系统识别为点击且不影响高频连点
         private const val CLICK_DURATION_MS = 60L
+        // 双击时第二击相对第一击的延迟，模拟真实双击节奏
+        private const val DOUBLE_TAP_GAP_MS = 30L
 
-        // MainActivity 通过静态引用控制控制条显隐，服务断开时置空
+        // MainActivity 通过静态引用控制胶囊条显隐，服务断开时置空
         var instance: ClickerService? = null
             private set
+
+        // 运行/录制/选点/设置变化回调，供主界面刷新按钮与字段状态
+        var onRunningChanged: (() -> Unit)? = null
+        var onRecordingChanged: (() -> Unit)? = null
+        var onSettingsChanged: (() -> Unit)? = null
+        var onTargetPicked: ((Int, Int) -> Unit)? = null
     }
 
     enum class Mode { CONTINUOUS, MACRO }
@@ -28,16 +36,22 @@ class ClickerService : AccessibilityService() {
         private set
     var intervalMs = 100L
     var loops = 0            // 0 表示无限循环，直到手动停止
+        set(v) {
+            field = if (v < 0) 0 else v
+            onSettingsChanged?.invoke()
+        }
     var gapMs = 500L         // 宏回放的循环间隔
+    var clicksPerPress = 1   // 1=单击 2=双击
     var targetX = 0
     var targetY = 0
     var hasTarget = false
     var isRecording = false
         private set
+    var isRunning = false
+        private set
     var selectedMacro: MacroStore.Macro? = null
         private set
 
-    private var running = false
     private var clickCount = 0
     private var playLoopIndex = 0
     private var playStepIndex = 0
@@ -54,7 +68,13 @@ class ClickerService : AccessibilityService() {
         instance = this
         store = MacroStore(this)
         overlay = OverlayController(this, getSystemService(WINDOW_SERVICE) as WindowManager)
-        overlay.showBar()
+        // 服务可能被系统重建，坐标从偏好恢复，避免界面显示有坐标而服务认为没选点
+        val p = getSharedPreferences("autoclicker", MODE_PRIVATE)
+        if (p.getBoolean("thas", false)) {
+            targetX = p.getInt("tx", 0)
+            targetY = p.getInt("ty", 0)
+            hasTarget = true
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -82,16 +102,21 @@ class ClickerService : AccessibilityService() {
         if (::overlay.isInitialized) overlay.hideBar()
     }
 
-    fun toggleMode() {
-        // 切模式前先停，避免旧调度任务在新模式下继续跑
+    // 主界面切换分页时同步运行模式
+    fun setMode(macro: Boolean) {
         stopRunning()
-        mode = if (mode == Mode.CONTINUOUS) Mode.MACRO else Mode.CONTINUOUS
+        mode = if (macro) Mode.MACRO else Mode.CONTINUOUS
+    }
+
+    fun overlayPick() {
+        if (::overlay.isInitialized) overlay.showPickLayer()
     }
 
     fun setTarget(x: Int, y: Int) {
         targetX = x
         targetY = y
         hasTarget = true
+        onTargetPicked?.invoke(x, y)
     }
 
     fun selectMacro(name: String) {
@@ -119,30 +144,31 @@ class ClickerService : AccessibilityService() {
     fun macroNames(): List<String> = store.names()
 
     fun start() {
-        if (running) return
+        if (isRunning) return
         when (mode) {
             Mode.CONTINUOUS -> {
                 if (!hasTarget) {
-                    overlay.toast("请先用[选点]确定点击位置")
+                    if (::overlay.isInitialized) overlay.toast("请先用「点击位置」确定坐标")
                     return
                 }
-                running = true
+                isRunning = true
                 clickCount = 0
                 handler.postDelayed(continuousTick, intervalMs)
             }
             Mode.MACRO -> {
                 val macro = selectedMacro
                 if (macro == null || macro.steps.isEmpty()) {
-                    overlay.toast("请先在[存档]中选择宏")
+                    if (::overlay.isInitialized) overlay.toast("请先在「回放存档」中选择宏")
                     return
                 }
-                running = true
+                isRunning = true
                 playLoopIndex = 0
                 playStepIndex = 0
                 handler.postDelayed(macroTick, macro.steps[0].interval.coerceAtLeast(1L))
             }
         }
-        overlay.refreshState()
+        onRunningChanged?.invoke()
+        if (::overlay.isInitialized) overlay.refreshState()
     }
 
     fun stop() {
@@ -150,16 +176,18 @@ class ClickerService : AccessibilityService() {
     }
 
     private fun stopRunning() {
-        running = false
+        if (!isRunning) return
+        isRunning = false
         handler.removeCallbacks(continuousTick)
         handler.removeCallbacks(macroTick)
+        onRunningChanged?.invoke()
         if (::overlay.isInitialized) overlay.refreshState()
     }
 
     // 连续点击：固定点按 intervalMs 间隔重复，loops=0 表示无限
     private val continuousTick = object : Runnable {
         override fun run() {
-            if (!running) return
+            if (!isRunning) return
             dispatchClick(targetX, targetY)
             clickCount++
             if (loops > 0 && clickCount >= loops) {
@@ -173,7 +201,7 @@ class ClickerService : AccessibilityService() {
     // 宏回放：按每步 interval 依次点击，一轮结束后等待 gap 再进入下一轮
     private val macroTick = object : Runnable {
         override fun run() {
-            if (!running) return
+            if (!isRunning) return
             val macro = selectedMacro ?: run { stopRunning(); return }
             if (macro.steps.isEmpty()) {
                 stopRunning()
@@ -198,18 +226,27 @@ class ClickerService : AccessibilityService() {
 
     // 核心原理：无障碍服务可向系统注入任意手势，无需 root
     private fun dispatchClick(x: Int, y: Int) {
-        val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
-        val stroke = GestureDescription.StrokeDescription(path, 0L, CLICK_DURATION_MS)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-        dispatchGesture(gesture, null, handler)
+        val builder = GestureDescription.Builder()
+        val p1 = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+        builder.addStroke(GestureDescription.StrokeDescription(p1, 0L, CLICK_DURATION_MS))
+        if (clicksPerPress == 2) {
+            val p2 = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+            builder.addStroke(
+                GestureDescription.StrokeDescription(p2, CLICK_DURATION_MS + DOUBLE_TAP_GAP_MS, CLICK_DURATION_MS)
+            )
+        }
+        dispatchGesture(builder.build(), null, handler)
     }
 
     // 录制：捕获层把按下坐标转给这里，interval 记录与上一步的时间差
     fun startRecording() {
+        stopRunning()
         recordedSteps.clear()
         lastRecordTime = SystemClock.uptimeMillis()
         isRecording = true
         overlay.showRecordLayer()
+        onRecordingChanged?.invoke()
+        if (::overlay.isInitialized) overlay.refreshState()
     }
 
     fun onRecordTouch(x: Int, y: Int) {
@@ -223,7 +260,11 @@ class ClickerService : AccessibilityService() {
 
     fun stopRecording() {
         isRecording = false
-        overlay.hideRecordLayer()
-        overlay.toast("已录制 ${recordedSteps.size} 步，可在[存档]中保存")
+        if (::overlay.isInitialized) {
+            overlay.hideRecordLayer()
+            overlay.toast("已录制 ${recordedSteps.size} 步，可在「新建存档」中保存")
+        }
+        onRecordingChanged?.invoke()
+        if (::overlay.isInitialized) overlay.refreshState()
     }
 }
