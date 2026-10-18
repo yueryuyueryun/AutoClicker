@@ -75,7 +75,16 @@ class MainActivity : Activity() {
         syncRecord()
         syncPick()
         refreshSlots()
+        // 回到前台时收起悬浮胶囊条：胶囊只在应用退到后台时存在
+        ClickerService.instance?.hideBar()
         ClickerService.instance?.let { pushSettings(it) }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // 退到后台（返回键/上滑）后，若仍在执行或录制，保留置顶胶囊条
+        val svc = ClickerService.instance
+        if (svc != null && (svc.isRunning || svc.isRecording)) svc.showBar()
     }
 
     override fun onDestroy() {
@@ -91,17 +100,18 @@ class MainActivity : Activity() {
 
     private fun buildUi() {
         val p = Theme.pal
-        window.statusBarColor = p.pageBg
-        if (!Theme.dark) {
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        }
+        // 安卓原生做法：状态栏/导航栏与页面同色一体，不做桌面式窗口条
+        window.statusBarColor = p.card
+        window.navigationBarColor = p.card
+        // 边到边：内容延伸到状态栏下方，再由标题栏顶部内边距让开状态栏
+        var flags = View.SYSTEM_UI_FLAG_LAYOUT_STABLE or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
+        if (!Theme.dark) flags = flags or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        window.decorView.systemUiVisibility = flags
 
-        val root = FrameLayout(this).apply { setBackgroundColor(p.pageBg) }
+        val root = FrameLayout(this).apply { setBackgroundColor(p.card) }
         card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = solid(this@MainActivity, p.card, 18f, p.cardBorder)
-            elevation = dp(this@MainActivity, 10f).toFloat()
-            setPadding(dp(this@MainActivity, 22f), dp(this@MainActivity, 16f),
+            setPadding(dp(this@MainActivity, 22f), dp(this@MainActivity, 16f) + statusBarHeight(),
                 dp(this@MainActivity, 22f), dp(this@MainActivity, 20f))
         }
         root.addView(
@@ -109,10 +119,7 @@ class MainActivity : Activity() {
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
-            ).apply {
-                leftMargin = dp(this@MainActivity, 12f); rightMargin = dp(this@MainActivity, 12f)
-                topMargin = dp(this@MainActivity, 12f); bottomMargin = dp(this@MainActivity, 12f)
-            }
+            )
         )
         setContentView(root)
 
@@ -164,14 +171,6 @@ class MainActivity : Activity() {
             recreate()
         }
         bar.addView(themeBtn)
-        bar.addView(winButton("─") {
-            ClickerService.instance?.showBar()
-            moveTaskToBack(true)
-        })
-        bar.addView(winButton("✕") {
-            ClickerService.instance?.showBar()
-            finish()
-        })
         addView(card, bar, bottomMargin = dp(this, 14f))
     }
 
@@ -745,6 +744,12 @@ class MainActivity : Activity() {
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+
+    // 状态栏高度：边到边布局时给标题栏留出顶部内边距，避免文字被状态栏压住
+    private fun statusBarHeight(): Int {
+        val id = resources.getIdentifier("status_bar_height", "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id) else dp(this, 24f)
+    }
 }
 
 fun EditText.addTextChangedListener(afterChanged: (String) -> Unit) {

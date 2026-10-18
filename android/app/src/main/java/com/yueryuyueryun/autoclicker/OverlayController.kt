@@ -92,8 +92,10 @@ class OverlayController(
     }
 
     fun refreshState() {
-        // 胶囊条内容随录制/执行状态整体重建，保证按钮语义与电脑版一致
-        if (service.isRecording || service.isRunning) showBar() else hideBar()
+        // 胶囊条内容随录制/执行状态整体重建，保证按钮语义与电脑版一致。
+        // 关键：执行自然结束后（isRunning=false）只要胶囊条还挂着就保留它，
+        // 直到用户点「返回应用」才消失，符合安卓置顶悬浮窗的预期。
+        if (service.isRecording || service.isRunning || barView != null) showBar() else hideBar()
     }
 
     fun toast(msg: String) {
@@ -111,11 +113,17 @@ class OverlayController(
     private fun buildExecPill(): View {
         val ctx = service
         val root = pillRoot(ctx)
-        root.addView(pillButton(ctx, "终止执行", danger = true) { service.stop() }.compact())
-        root.addView(ghostButton(ctx, "返回应用") {
+        // 只有正在执行时才显示「终止执行」；执行结束后胶囊条保留，
+        // 仅剩「返回应用 / 再执行一次」，等用户主动返回应用才消失
+        if (service.isRunning) {
+            root.addView(pillButton(ctx, "终止执行", danger = true) { service.stop() }.compact())
+        }
+        val back = ghostButton(ctx, "返回应用") {
             hideBar()
             openApp()
-        }.compact().apply { margin() })
+        }.compact()
+        if (service.isRunning) back.margin()
+        root.addView(back)
         root.addView(pillButton(ctx, "再执行一次") { service.start() }.compact().apply { margin() })
         root.addView(View(ctx), LinearLayout.LayoutParams(0, 1, 1f))
 

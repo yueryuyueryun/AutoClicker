@@ -275,7 +275,8 @@ class ClickerService : AccessibilityService() {
             }
         }
         onRecordingChanged?.invoke()
-        if (::overlay.isInitialized) overlay.refreshState()
+        // 录制结束后自动回到应用，胶囊条不再保留（与执行完成后的保留策略区分开）
+        if (::overlay.isInitialized) overlay.hideBar()
         // 与电脑版 _exit_compact 一致：停止录制后主窗口自动回到前台
         packageManager.getLaunchIntentForPackage(packageName)?.let {
             it.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
