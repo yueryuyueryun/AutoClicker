@@ -76,6 +76,8 @@ class ClickerService : AccessibilityService() {
             targetY = p.getInt("ty", 0)
             hasTarget = true
         }
+        // 次数以主界面偏好为唯一来源：服务晚于界面启动时也不能退回默认 0（无限）
+        loops = p.getString("loops", "1")?.toIntOrNull() ?: 1
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -216,7 +218,8 @@ class ClickerService : AccessibilityService() {
             } else {
                 playStepIndex = 0
                 playLoopIndex++
-                if (macro.loops > 0 && playLoopIndex >= macro.loops) {
+                // 与电脑版一致：循环次数是全局设置，不随存档各自为政
+                if (loops > 0 && playLoopIndex >= loops) {
                     stopRunning()
                     return
                 }
