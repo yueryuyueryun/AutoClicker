@@ -4,5 +4,6 @@ build/
 dist/
 macros.json
 settings.json
+selftest.log
 _*.py
 _*.png

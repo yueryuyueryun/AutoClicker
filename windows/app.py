@@ -12,8 +12,9 @@ import time
 import math
 import shutil
 import ctypes
+import tempfile
 from ctypes import wintypes
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from collections import deque
 
 from PySide6.QtCore import (
@@ -35,7 +36,7 @@ from pynput import mouse
 
 import icon_rc  # noqa: F401  注册 :/app.ico 资源
 
-_user32 = ctypes.windll.user32
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
 # HWND_TOPMOST / HWND_NOTOPMOST 是指针宽度的 -1 / -2，必须按 64 位 HWND 传参；
 # 无 argtypes 时按 32 位 int 传入，x64 下高位未定义，置顶会静默失效
 _user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
@@ -43,11 +44,147 @@ _user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
                                  wintypes.UINT]
 _user32.SetWindowPos.restype = wintypes.BOOL
 
+# ---------------- 录制底层：低级钩子 / 原始输入 / 全局状态轮询 ----------------
+WH_MOUSE_LL = 14
+WM_INPUT = 0x00FF
+WM_QUIT = 0x0012
+GA_ROOT = 2
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_INPUTSINK = 0x00000100
+RIDEV_REMOVE = 0x00000001
+
+# WH_MOUSE_LL 的 wParam → (按键, 是否按下)
+_BTN_CODES = {
+    0x0201: (mouse.Button.left, True), 0x0202: (mouse.Button.left, False),
+    0x0204: (mouse.Button.right, True), 0x0205: (mouse.Button.right, False),
+    0x0207: (mouse.Button.middle, True), 0x0208: (mouse.Button.middle, False),
+}
+# WM_INPUT 的 usButtonFlags 位 → (按键, 是否按下)
+_RAW_BTN_FLAGS = (
+    (0x0001, mouse.Button.left, True), (0x0002, mouse.Button.left, False),
+    (0x0004, mouse.Button.right, True), (0x0008, mouse.Button.right, False),
+    (0x0010, mouse.Button.middle, True), (0x0020, mouse.Button.middle, False),
+)
+
+
+class _MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [("pt", wintypes.POINT),
+                ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_void_p)]
+
+
+class _RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD),
+                ("hDevice", wintypes.HANDLE), ("wParam", wintypes.WPARAM)]
+
+
+class _RAWMOUSE(ctypes.Structure):
+    # 注意：usFlags 后有两个字节填充，按钮位在偏移 4 处（C 版是 USHORT+union ULONG）
+    _fields_ = [("usFlags", wintypes.USHORT),
+                ("_pad", wintypes.USHORT),
+                ("usButtonFlags", wintypes.USHORT),
+                ("usButtonData", wintypes.USHORT),
+                ("ulRawButtons", wintypes.ULONG),
+                ("lLastX", wintypes.LONG),
+                ("lLastY", wintypes.LONG),
+                ("ulExtraInformation", wintypes.ULONG)]
+
+
+class _RAWINPUT(ctypes.Structure):
+    _fields_ = [("header", _RAWINPUTHEADER), ("mouse", _RAWMOUSE)]
+
+
+class _RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT),
+                ("dwFlags", wintypes.DWORD), ("hwndTarget", wintypes.HWND)]
+
+
+_HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                               wintypes.WPARAM, wintypes.LPARAM)
+
+_user32.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC,
+                                      wintypes.HINSTANCE, wintypes.DWORD]
+_user32.SetWindowsHookExW.restype = wintypes.HHOOK
+_user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int,
+                                   wintypes.WPARAM, wintypes.LPARAM]
+_user32.CallNextHookEx.restype = ctypes.c_ssize_t
+_user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+_user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+_user32.GetCursorPos.restype = wintypes.BOOL
+_user32.WindowFromPoint.argtypes = [wintypes.POINT]
+_user32.WindowFromPoint.restype = wintypes.HWND
+_user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+_user32.GetAncestor.restype = wintypes.HWND
+_user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_user32.GetAsyncKeyState.restype = ctypes.c_short
+_user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(_RAWINPUTDEVICE),
+                                            wintypes.UINT, wintypes.UINT]
+_user32.RegisterRawInputDevices.restype = wintypes.BOOL
+_user32.GetRawInputData.argtypes = [wintypes.HANDLE, wintypes.UINT,
+                                    ctypes.c_void_p,
+                                    ctypes.POINTER(wintypes.UINT), wintypes.UINT]
+_user32.GetRawInputData.restype = wintypes.UINT
+
+
+def cursor_pos():
+    """光标的物理像素坐标：与 Qt 逻辑像素无关，多屏混合缩放下也不会错位。"""
+    pt = wintypes.POINT()
+    if not _user32.GetCursorPos(ctypes.byref(pt)):
+        return None
+    return pt.x, pt.y
+
+
+def root_window_at(x, y):
+    """物理坐标点下方窗口的顶层 HWND，取不到返回 0。"""
+    hwnd = _user32.WindowFromPoint(wintypes.POINT(int(x), int(y)))
+    if not hwnd:
+        return 0
+    return _user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+
+
+def _window_class(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    if not _user32.GetClassNameW(wintypes.HWND(int(hwnd)), buf, 256):
+        return ""
+    return buf.value
+
+
+def _selftest_log_path():
+    """自检日志：优先 exe 同目录，不可写时退回临时目录。"""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    for folder in (base, tempfile.gettempdir()):
+        path = os.path.join(folder, "selftest.log")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("")
+            return path
+        except OSError:
+            continue
+    return os.path.join(tempfile.gettempdir(), "selftest.log")
+
+
+def _selftest_click(x, y):
+    """自检用的一次真实左键点击（会短暂移动光标，结束后由调用方还原）。"""
+    _user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.05)
+    _user32.mouse_event(0x0002, 0, 0, 0, 0)      # MOUSEEVENTF_LEFTDOWN
+    time.sleep(0.05)
+    _user32.mouse_event(0x0004, 0, 0, 0, 0)      # MOUSEEVENTF_LEFTUP
+
+
+
 MACRO_H = 648
 CONT_H = MACRO_H  # 两页同高：切换时窗口高度不变，页转只做纯水平移动
 PILL_H = 72
 PILL_W_EXEC = 384
-PILL_W_RECORD = 208
+PILL_W_RECORD = 330
 
 BTN_NAMES = {mouse.Button.left: "左", mouse.Button.right: "右", mouse.Button.middle: "中"}
 BTN_FROM_NAME = {"左": mouse.Button.left, "右": mouse.Button.right, "中": mouse.Button.middle}
@@ -190,6 +327,8 @@ QPushButton#pillGhost {
 }
 QPushButton#pillGhost:hover { color: %(text)s; border: 1px solid #5b7cfa; }
 QPushButton#pillGhost:disabled { color: %(dim)s; }
+QLabel#pillCount { font-size: 13px; font-weight: 600; color: #22c1a3; }
+QLabel#pillHint { font-size: 11px; color: %(dim)s; }
 
 QTableWidget {
     background: %(table_bg)s; border: 1px solid %(field_border)s; border-radius: 10px;
@@ -567,7 +706,7 @@ class PromptDialog(QDialog):
 class AboutDialog(QDialog):
     """关于卡片：Logo、版本、作者署名与开源地址。"""
 
-    VERSION = "1.0.0"
+    VERSION = "1.1.0"
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -665,6 +804,157 @@ class AboutDialog(QDialog):
         return self.exec()
 
 
+class MouseCapture:
+    """三通道全局鼠标采集：低级钩子 + 全局状态轮询 + 原始输入。
+
+    游戏 / 全屏 / 提权窗口往往只掐断其中一条采集路径：
+    - WH_MOUSE_LL 会被 UIPI 从提权窗口的输入链里摘掉；
+    - 传统鼠标消息可能被 RIDEV_NOLEGACY 屏蔽，GetAsyncKeyState 也随之读不到；
+    - RIDEV_INPUTSINK 的 WM_INPUT 即使窗口不在前台也照样送达。
+    三条通道并行、按 (按键, 30ms) 去重，任何一条活着就能录到点击。
+    """
+
+    DEDUPE = 0.03
+
+    def __init__(self, on_event):
+        self.on_event = on_event      # (x, y, button, pressed, t, channel)
+        self.hook_ok = False
+        self.raw_ok = False
+        self.counts = {"hook": 0, "poll": 0, "raw": 0}
+        self.errors = []
+        self._lock = Lock()
+        self._stop = Event()
+        self._poll_thread = None
+        self._hook_handle = 0
+        self._hook_proc = None
+        self._last_press = {}
+        self._running = False
+
+    # ---- 生命周期 ----
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._stop.clear()
+        self._last_press.clear()
+        self.counts = {"hook": 0, "poll": 0, "raw": 0}
+        self._install_hook()
+        self._poll_thread = Thread(target=self._poll_loop, daemon=True,
+                                   name="mouse-poll")
+        self._poll_thread.start()
+
+    def stop(self):
+        self._running = False
+        self._stop.set()
+        self._remove_hook()
+        if self._poll_thread is not None:
+            self._poll_thread.join(timeout=0.4)
+            self._poll_thread = None
+
+    def alive(self, timeout=0.3):
+        """至少一条通道可用即视为可录制（轮询线程起来需要一点点时间）。"""
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if self.hook_ok or self.raw_ok or (
+                    self._poll_thread is not None
+                    and self._poll_thread.is_alive()):
+                return True
+            time.sleep(0.01)
+        return False
+
+    def total_events(self):
+        with self._lock:
+            return sum(self.counts.values())
+
+    def summary(self):
+        labels = (("hook", "钩子"), ("poll", "轮询"), ("raw", "原始输入"))
+        with self._lock:
+            return " / ".join(f"{name} {self.counts.get(key, 0)}"
+                              for key, name in labels)
+
+    # ---- 通道 A：低级鼠标钩子（挂在主线程消息循环上，无需自建泵）----
+    def _install_hook(self):
+        try:
+            proc = _HOOKPROC(self._hook_proc_impl)
+            handle = _user32.SetWindowsHookExW(WH_MOUSE_LL, proc, None, 0)
+        except (OSError, ctypes.ArgumentError) as exc:
+            self.errors.append(f"钩子安装异常：{exc}")
+            return
+        if not handle:
+            self.errors.append(f"钩子安装失败（错误码 {ctypes.get_last_error()}）")
+            return
+        # 回调必须持有强引用：被 GC 回收后钩子会静默失效
+        self._hook_proc = proc
+        self._hook_handle = handle
+        self.hook_ok = True
+
+    def _remove_hook(self):
+        if self._hook_handle:
+            _user32.UnhookWindowsHookEx(self._hook_handle)
+        self._hook_handle = 0
+        self._hook_proc = None
+        self.hook_ok = False
+
+    def _hook_proc_impl(self, n_code, w_param, l_param):
+        try:
+            if n_code >= 0:
+                item = _BTN_CODES.get(int(w_param))
+                if item is not None:
+                    data = ctypes.cast(
+                        l_param, ctypes.POINTER(_MSLLHOOKSTRUCT)).contents
+                    self._emit(data.pt.x, data.pt.y, item[0], item[1], "hook")
+        except Exception:
+            pass
+        # 必须放行：低级钩子吞掉事件会让整个系统的鼠标点击失灵
+        return _user32.CallNextHookEx(None, n_code, w_param, l_param)
+
+    # ---- 通道 B：GetAsyncKeyState 轮询（钩子失效时的兜底）----
+    def _poll_loop(self):
+        vks = ((mouse.Button.left, 0x01), (mouse.Button.right, 0x02),
+               (mouse.Button.middle, 0x04))
+        prev = {vk: False for _, vk in vks}
+        while not self._stop.is_set():
+            for btn, vk in vks:
+                down = bool(_user32.GetAsyncKeyState(vk) & 0x8000)
+                if down != prev[vk]:
+                    prev[vk] = down
+                    pos = cursor_pos()
+                    if pos is not None:
+                        self._emit(pos[0], pos[1], btn, down, "poll")
+            self._stop.wait(0.004)
+
+    # ---- 通道 C：原始输入（WM_INPUT，主线程 nativeEvent 喂进来）----
+    def feed_raw(self, button_flags):
+        if not self._running:
+            return
+        for bit, button, pressed in _RAW_BTN_FLAGS:
+            if button_flags & bit:
+                pos = cursor_pos()
+                if pos is not None:
+                    self._emit(pos[0], pos[1], button, pressed, "raw")
+
+    # ---- 合并去重 ----
+    def _emit(self, x, y, button, pressed, channel):
+        if not self._running:
+            return
+        now = time.perf_counter()
+        with self._lock:
+            self.counts[channel] = self.counts.get(channel, 0) + 1
+            dup = False
+            if pressed:
+                last = self._last_press.get(button)
+                if last is not None and now - last < self.DEDUPE:
+                    dup = True
+                else:
+                    self._last_press[button] = now
+        if dup:
+            return
+        try:
+            self.on_event(int(x), int(y), button, bool(pressed), now, channel)
+        except Exception:
+            pass
+
+
 class MainWindow(QWidget):
     sig_finished = Signal()
 
@@ -692,12 +982,17 @@ class MainWindow(QWidget):
         self._saved_geo = None
         self.stop_event = Event()
         self.worker = None
-        self.record_thread = None
+        # 录制：三通道采集器 + 主线程排空队列（跨线程 Qt 信号投递不进来）
+        self._capture = MouseCapture(self._on_capture_event)
         self._record_queue = deque()
         self._record_drain = QTimer(self)
         self._record_drain.setInterval(30)
         self._record_drain.timeout.connect(self._drain_record_queue)
         self._last_record_t = None
+        self._record_t0 = 0.0
+        self._own_hwnds_cache = set()
+        self._raw_registered = False
+        self._raw_hwnd = 0
         self._drag_pos = None
         self._closing = False
         self._minimizing = False
@@ -803,6 +1098,8 @@ class MainWindow(QWidget):
         self.panel_macro.hide()
 
         self.slots = self._load_slots()
+        if getattr(self, "_slots_migrated", False):
+            self._save_slots()
         self.slot_idx = 0 if self.slots else -1
         self._refresh_slot_list()
         if self.slots:
@@ -819,8 +1116,18 @@ class MainWindow(QWidget):
 
     def _build_pills(self):
         rec_lay = QHBoxLayout(self.pill_record)
-        rec_lay.setContentsMargins(10, 8, 10, 8)
+        rec_lay.setContentsMargins(12, 8, 10, 8)
         rec_lay.setSpacing(8)
+        rec_info = QVBoxLayout()
+        rec_info.setContentsMargins(0, 0, 0, 0)
+        rec_info.setSpacing(2)
+        self.pill_count = QLabel("● 已录制 0 步")
+        self.pill_count.setObjectName("pillCount")
+        self.pill_hint = QLabel("点游戏画面即可录制")
+        self.pill_hint.setObjectName("pillHint")
+        rec_info.addWidget(self.pill_count)
+        rec_info.addWidget(self.pill_hint)
+        rec_lay.addLayout(rec_info, 1)
         self.pill_stop_record = QPushButton("停止录制")
         self.pill_stop_record.setObjectName("pillBtn")
         self.pill_stop_record.setProperty("danger", True)
@@ -1166,6 +1473,8 @@ class MainWindow(QWidget):
 
     def _assert_topmost(self):
         if self.compact:
+            # 顺手刷新自身窗口句柄：连点线程靠它判断光标是否压在本程序窗口上
+            self._own_hwnds_cache = self._own_hwnds()
             self._apply_topmost(True)
 
     def _enter_compact(self, kind, on_shown=None):
@@ -1266,6 +1575,7 @@ class MainWindow(QWidget):
         self.running = True
         self.click_count = 0
         self.stop_event = Event()
+        self._own_hwnds_cache = self._own_hwnds()
         self.worker = Thread(target=self._click_loop, daemon=True)
         self._sync_start_btn()
         self._sync_exec_pill()
@@ -1282,6 +1592,7 @@ class MainWindow(QWidget):
         self.running = True
         self.click_count = 0
         self.stop_event = Event()
+        self._own_hwnds_cache = self._own_hwnds()
         self.worker = Thread(target=self._replay_loop, args=(steps,), daemon=True)
         self._sync_start_btn()
         self._sync_exec_pill()
@@ -1314,14 +1625,13 @@ class MainWindow(QWidget):
 
     def _click_loop(self):
         ctrl = mouse.Controller()
-        dpr = self.devicePixelRatioF() or 1.0
         btn = self.mouse_button
         n = self.clicks_per_press
         reached = False
         while not self.stop_event.is_set():
-            pos = ctrl.position
-            lx, ly = int(pos[0] / dpr), int(pos[1] / dpr)
-            if self.frameGeometry().contains(QPoint(lx, ly)):
+            pos = cursor_pos()
+            # 光标压在本程序悬浮条上时不点，否则会把自己的按钮点掉
+            if pos is not None and root_window_at(*pos) in self._own_hwnds_cache:
                 if self.stop_event.wait(self.interval_sec):
                     break
                 continue
@@ -1340,7 +1650,6 @@ class MainWindow(QWidget):
 
     def _replay_loop(self, steps):
         ctrl = mouse.Controller()
-        dpr = self.devicePixelRatioF() or 1.0
         done = 0
         while not self.stop_event.is_set():
             loops = self.loop_spin.value()
@@ -1349,8 +1658,8 @@ class MainWindow(QWidget):
                 if self.stop_event.is_set():
                     seq_ok = False
                     break
-                # 表格存逻辑坐标；Controller 在 DPI 感知进程里按物理坐标解释
-                ctrl.position = (round(st["x"] * dpr), round(st["y"] * dpr))
+                # 存档里是物理像素坐标，Controller 在 DPI 感知进程里也按物理像素下针
+                ctrl.position = (int(st["x"]), int(st["y"]))
                 for _ in range(st["count"]):
                     ctrl.click(st["button"])
                     self.click_count += 1
@@ -1376,91 +1685,140 @@ class MainWindow(QWidget):
     def toggle_recording(self, ask_save=True):
         if self.running:
             self.stop_running()
-        self.recording = not self.recording
         if self.recording:
-            # 新录制只保留本次动作，否则会把当前存档的旧行一起录进去
-            self.step_table.setRowCount(0)
-            self._last_record_t = None
-            # 游戏全屏/提权窗口常使鼠标低级钩子被系统摘除，改轮询全局输入状态，录制更稳
-            self.record_thread = Thread(target=self._record_poll_loop, daemon=True)
-            self.record_thread.start()
-            time.sleep(0.05)
-            if not self.record_thread.is_alive():
-                self.record_thread = None
-                self.recording = False
-                QMessageBox.warning(self, "录制失败",
-                                    "鼠标监听服务启动失败，请重试。")
-                return
-            self._record_drain.start()
-            self.record_btn.setProperty("recording", True)
-            repolish(self.record_btn)
-            self.record_btn.setText("停止录制")
-            self._enter_compact("record")
+            self._stop_recording(ask_save)
         else:
-            hook_alive = self.record_thread.is_alive() \
-                if self.record_thread else False
-            if self.record_thread is not None:
-                self.record_thread.join(timeout=0.5)
-                self.record_thread = None
-            self._record_drain.stop()
-            self._drain_record_queue()
-            self.record_btn.setProperty("recording", False)
-            repolish(self.record_btn)
-            self.record_btn.setText("开始录制")
-            self._exit_compact()
-            if ask_save:
-                # 自动填入：最后一次点击到停止录制之间的自然停顿作为循环间隔
-                if self._last_record_t:
-                    pause = (time.perf_counter() - self._last_record_t)
-                    self.loop_gap_spin.setValue(
-                        max(0.0, min(round(pause, 1), 600.0)))
-                idx = self.slot_idx
-                if 0 <= idx < len(self.slots):
-                    if self.step_table.rowCount() > 0:
-                        # 已选中存档：录制结果直接写入该存档
-                        self.slots[idx]["steps"] = self._steps_for_save()
-                        self._save_slots()
-                        self._refresh_slot_list()
-                    else:
-                        # 一个点击都没录到不清空旧存档，避免静默丢数据
-                        reason = "" if hook_alive else "（录制钩子中途失效）"
-                        QMessageBox.information(
-                            self, "录制结束",
-                            f"未录制到任何点击{reason}，存档内容保持不变。")
-                else:
-                    self._prompt_save_slot()
+            self._start_recording()
 
-    # 轮询全局鼠标状态录制触点：低级钩子在游戏全屏/提权窗口下会被系统摘除，
-    # 而 GetAsyncKeyState 读的是全局输入状态，不受钩子失效与完整性级别影响。
-    # 轮询线程只做无锁入队，跨线程 Qt 信号无法投递，改由主线程 QTimer 排空队列。
-    def _record_poll_loop(self):
-        user32 = ctypes.windll.user32
-        vks = ((mouse.Button.left, 0x01),
-               (mouse.Button.right, 0x02),
-               (mouse.Button.middle, 0x04))
-        prev = {vk: False for _, vk in vks}
-        pt = wintypes.POINT()
-        while self.recording:
-            for btn, vk in vks:
-                down = bool(user32.GetAsyncKeyState(vk) & 0x8000)
-                if down != prev[vk]:
-                    prev[vk] = down
-                    if user32.GetCursorPos(ctypes.byref(pt)):
-                        self._record_queue.append(
-                            (pt.x, pt.y, btn, down, time.perf_counter()))
-            time.sleep(0.004)
+    def _start_recording(self):
+        # 新录制只保留本次动作，否则会把当前存档的旧行一起录进去
+        self.step_table.setRowCount(0)
+        self._last_record_t = None
+        self._record_t0 = time.perf_counter()
+        self._record_queue.clear()
+        self.recording = True
+        self._capture = MouseCapture(self._on_capture_event)
+        self._capture.start()
+        self._register_raw_input()      # 先把第三路挂上，再判定是否全灭
+        if not self._capture.alive():
+            # 钩子/轮询都起不来才报错；提示里带上底层错误方便定位
+            detail = "；".join(self._capture.errors) or "未取得任何鼠标事件"
+            self.recording = False
+            self._capture.stop()
+            self._unregister_raw_input()
+            QMessageBox.warning(self, "录制失败",
+                                f"鼠标监听服务启动失败（{detail}），请重试。")
+            return
+        self._record_drain.start()
+        self.record_btn.setProperty("recording", True)
+        repolish(self.record_btn)
+        self.record_btn.setText("停止录制")
+        self.pill_count.setText("● 已录制 0 步")
+        self.pill_hint.setText("点游戏画面即可录制")
+        self._own_hwnds_cache = self._own_hwnds()
+        self._enter_compact("record")
+        # 必须等紧凑模式切换完再注册：setWindowFlags 可能重建原生窗口
+        self._register_raw_input()
+
+    def _stop_recording(self, ask_save=True):
+        self.recording = False           # 先落旗标，排空时不再重新注册原始输入
+        self._capture.stop()
+        self._unregister_raw_input()
+        self._record_drain.stop()
+        self._drain_record_queue()
+        self.record_btn.setProperty("recording", False)
+        repolish(self.record_btn)
+        self.record_btn.setText("开始录制")
+        self._exit_compact()
+        if not ask_save:
+            return
+        if self.step_table.rowCount() == 0:
+            # 一个点击都没录到不清空旧存档，避免静默丢数据
+            self._recording_empty_dialog()
+            return
+        # 自动填入：最后一次点击到停止录制之间的自然停顿作为循环间隔
+        if self._last_record_t:
+            pause = time.perf_counter() - self._last_record_t
+            self.loop_gap_spin.setValue(
+                max(0.0, min(round(pause, 1), 600.0)))
+        idx = self.slot_idx
+        if 0 <= idx < len(self.slots):
+            # 已选中存档：录制结果直接写入该存档
+            self.slots[idx]["steps"] = self._steps_for_save()
+            self.slots[idx]["v"] = 2
+            self._save_slots()
+            self._refresh_slot_list()
+        else:
+            self._prompt_save_slot()
+
+    def _recording_empty_dialog(self):
+        """零步收尾：说清哪条采集通道没抓到，并给出可执行的下一步。"""
+        stats = self._capture.summary()
+        if self._capture.total_events() == 0:
+            message = (
+                "这次一个鼠标点击都没收到（采集通道：%s）。\n\n"
+                "请依次排查：\n"
+                "1. 点「停止录制」之外的游戏画面再试，别点在悬浮条上；\n"
+                "2. 游戏若以管理员身份运行，本程序也用管理员身份重开再录；\n"
+                "3. 全屏独占游戏先切「窗口化 / 无边框窗口」再录。" % stats)
+        else:
+            message = (
+                "收到的点击都落在本程序自己的窗口上（采集通道：%s）。\n\n"
+                "录制时请点游戏画面，不要点悬浮条和面板按钮。" % stats)
+        dlg = PromptDialog(self, "没有录到点击", message, prompt=False,
+                           confirm_text="以管理员身份重启")
+        if dlg.popup() == QDialog.Accepted:
+            self._restart_as_admin()
+
+    def _restart_as_admin(self):
+        """同权限重启：回放要点击提权窗口（管理员权限的游戏）时必须如此。"""
+        try:
+            params = (" ".join(f'"{a}"' for a in sys.argv)
+                      if not getattr(sys, "frozen", False) else "")
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params or None,
+                os.path.dirname(os.path.abspath(sys.executable)), 1)
+        except OSError as exc:
+            QMessageBox.warning(self, "重启失败", f"无法以管理员身份重启：{exc}")
+            return
+        if rc > 32:                     # ShellExecuteW 返回值 > 32 表示成功
+            self._closing = True
+            self.stop_all()
+            self.close()
+            QApplication.quit()
+        else:
+            QMessageBox.information(
+                self, "已取消", "没有获得管理员权限（UAC 被取消），继续以普通权限运行。")
+
+    # 采集线程回调：只把事件塞进队列，Qt 界面一律回主线程 QTimer 处理
+    def _on_capture_event(self, x, y, button, pressed, now, channel):
+        self._record_queue.append((x, y, button, pressed, now))
 
     def _drain_record_queue(self):
         while self._record_queue:
             x, y, button, pressed, t = self._record_queue.popleft()
             self._handle_record_click(x, y, button, pressed, now=t)
+        # 紧凑切换/置顶可能重建原生窗口，导致原始输入的 HWND 失效
+        if self.recording:
+            self._register_raw_input()
+        self._refresh_record_hint()
+
+    def _refresh_record_hint(self):
+        if not self.recording:
+            return
+        rows = self.step_table.rowCount()
+        self.pill_count.setText(f"● 已录制 {rows} 步")
+        if rows:
+            self.pill_hint.setText("已记录，点右侧按钮结束")
+        elif time.perf_counter() - self._record_t0 > 3.0:
+            self.pill_hint.setText("还没录到点击，点游戏画面试试")
 
     def _handle_record_click(self, x, y, button, pressed, now=None):
         if not pressed:
             return
-        dpr = self.devicePixelRatioF() or 1.0
-        x, y = round(x / dpr), round(y / dpr)
-        if self.frameGeometry().contains(QPoint(x, y)):
+        # 三通道给的都是物理像素，直接落地存储，回放时也按物理像素还原
+        x, y = int(x), int(y)
+        if self._is_own_point(x, y):
             return
         if now is None:
             now = time.perf_counter()
@@ -1472,6 +1830,68 @@ class MainWindow(QWidget):
             table.item(last, 4).setText(str(max(dt, 10)))
         self._last_record_t = now
         self._add_step_row(x, y, button, 1, 200)
+
+    def _own_hwnds(self):
+        """本程序所有可见顶层窗口的 HWND，用来过滤“点在自己界面上”的点击。"""
+        hwnds = set()
+        for widget in QApplication.topLevelWidgets():
+            try:
+                if widget.isVisible():
+                    hwnds.add(int(widget.winId()))
+            except (RuntimeError, TypeError):
+                continue
+        return hwnds
+
+    def _is_own_point(self, x, y):
+        root = root_window_at(x, y)
+        if not root:
+            return False
+        return root in self._own_hwnds()
+
+    # ---- 原始输入（RIDEV_INPUTSINK）：游戏屏蔽传统鼠标消息时的第三条路 ----
+    def _register_raw_input(self):
+        hwnd = int(self.winId())
+        if self._raw_hwnd == hwnd and self._raw_registered:
+            return True
+        dev = _RAWINPUTDEVICE(0x01, 0x02, RIDEV_INPUTSINK,
+                              wintypes.HWND(hwnd))
+        ok = bool(_user32.RegisterRawInputDevices(
+            ctypes.byref(dev), 1, ctypes.sizeof(_RAWINPUTDEVICE)))
+        self._raw_registered = ok
+        self._raw_hwnd = hwnd if ok else 0
+        self._capture.raw_ok = ok
+        if not ok and len(self._capture.errors) < 4:
+            self._capture.errors.append(
+                f"原始输入注册失败（错误码 {ctypes.get_last_error()}）")
+        return ok
+
+    def _unregister_raw_input(self):
+        if not self._raw_registered:
+            return
+        # RIDEV_REMOVE 反注册；否则窗口关掉后系统仍往这个 HWND 投 WM_INPUT
+        dev = _RAWINPUTDEVICE(0x01, 0x02, RIDEV_REMOVE, None)
+        _user32.RegisterRawInputDevices(ctypes.byref(dev), 1,
+                                       ctypes.sizeof(_RAWINPUTDEVICE))
+        self._raw_registered = False
+        self._raw_hwnd = 0
+        self._capture.raw_ok = False
+
+    def _on_raw_input(self, l_param):
+        size = wintypes.UINT(0)
+        header_size = ctypes.sizeof(_RAWINPUTHEADER)
+        _user32.GetRawInputData(wintypes.HANDLE(l_param), RID_INPUT, None,
+                                ctypes.byref(size), header_size)
+        if size.value < ctypes.sizeof(_RAWINPUT):
+            return
+        buf = ctypes.create_string_buffer(size.value)
+        got = _user32.GetRawInputData(wintypes.HANDLE(l_param), RID_INPUT, buf,
+                                      ctypes.byref(size), header_size)
+        if not got or got == 0xFFFFFFFF:
+            return
+        raw = ctypes.cast(buf, ctypes.POINTER(_RAWINPUT)).contents
+        if raw.header.dwType != RIM_TYPEMOUSE:
+            return
+        self._capture.feed_raw(raw.mouse.usButtonFlags)
 
     def _add_step_row(self, x, y, button, count, interval):
         table = self.step_table
@@ -1576,11 +1996,33 @@ class MainWindow(QWidget):
         try:
             with open(self._macro_file(), "r", encoding="utf-8") as f:
                 data = json.load(f)
-            return [s for s in data
-                    if isinstance(s, dict) and s.get("name")
-                    and isinstance(s.get("steps"), list)]
         except (OSError, ValueError):
             return []
+        if isinstance(data, dict):            # 兼容 {slots: [...]} 包装的存档
+            data = data.get("slots", [])
+        if not isinstance(data, list):
+            return []
+        slots = [s for s in data
+                 if isinstance(s, dict) and s.get("name")
+                 and isinstance(s.get("steps"), list)]
+        # v1 存档按 Qt 逻辑像素存坐标；现改为物理像素，首次读取时换算一次并回写
+        dpr = self.devicePixelRatioF() or 1.0
+        migrated = False
+        for slot in slots:
+            if slot.get("v", 1) >= 2:
+                continue
+            for st in slot.get("steps", []):
+                if not isinstance(st, dict) or "x" not in st or "y" not in st:
+                    continue
+                try:
+                    st["x"] = int(round(float(st["x"]) * dpr))
+                    st["y"] = int(round(float(st["y"]) * dpr))
+                except (TypeError, ValueError):
+                    continue
+            slot["v"] = 2
+            migrated = True
+        self._slots_migrated = migrated
+        return slots
 
     def _save_slots(self):
         try:
@@ -1648,7 +2090,7 @@ class MainWindow(QWidget):
         name = dlg.field.text().strip()
         if not name:
             return
-        self.slots.append({"name": name, "steps": []})
+        self.slots.append({"name": name, "steps": [], "v": 2})
         self._save_slots()
         self._refresh_slot_list(select=len(self.slots) - 1)
         self._load_slot_to_table(self.slots[-1])
@@ -1664,7 +2106,8 @@ class MainWindow(QWidget):
         if not name:
             return
         self.slots.append({"name": name, "steps": self._steps_for_save(),
-                           "gap": int(round(self.loop_gap_spin.value() * 1000))})
+                           "gap": int(round(self.loop_gap_spin.value() * 1000)),
+                           "v": 2})
         self._save_slots()
         self._refresh_slot_list(select=len(self.slots) - 1)
 
@@ -1943,6 +2386,13 @@ class MainWindow(QWidget):
                 msg = wintypes.MSG.from_address(int(message))
             except (ValueError, TypeError):
                 return super().nativeEvent(eventType, message)
+            if msg.message == WM_INPUT and self._raw_registered:
+                try:
+                    self._on_raw_input(msg.lParam)
+                except Exception:
+                    pass
+                # 返回 False 让 DefWindowProc 收尾，系统才会释放原始输入缓冲区
+                return False, 0
             if msg.message == 0x0112 and (msg.wParam & 0xFFF0) == 0xF020:
                 if not self._minimizing:
                     self._minimize()
@@ -1960,9 +2410,9 @@ class MainWindow(QWidget):
         self._closing = True
         self.stop_event.set()
         self.recording = False
-        if self.record_thread is not None:
-            self.record_thread.join(timeout=0.5)
-            self.record_thread = None
+        if self._capture is not None:
+            self._capture.stop()
+        self._unregister_raw_input()
         self.close()
         QApplication.quit()
 
@@ -1981,6 +2431,108 @@ class MainWindow(QWidget):
         self._drag_pos = None
         event.accept()
 
+    # ---------------- 自检（--selftest） ----------------
+    def run_selftest(self):
+        """无人值守自检：起三路采集 -> 在桌面空白处模拟点击 -> 校验落表 -> 写日志。
+
+        只点桌面空白处（Progman/WorkerW 上、任务栏上方），不碰其它程序，
+        不写任何存档；结果写到 exe 同目录（无权限时落临时目录）的 selftest.log。
+        """
+        path = _selftest_log_path()
+        lines = []
+        saved_cursor = cursor_pos()
+
+        def log(text):
+            lines.append(text)
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+            except OSError:
+                pass
+
+        log("AutoClicker 自检 " + AboutDialog.VERSION)
+        log("时间 " + time.strftime("%Y-%m-%d %H:%M:%S"))
+        log("屏幕 %dx%d  缩放 %.2f  冻结打包 %s" % (
+            _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1),
+            self.devicePixelRatioF(), bool(getattr(sys, "frozen", False))))
+
+        point = self._selftest_desktop_point()
+        self._switch_mode(1)
+        self.toggle_recording()
+        cap = self._capture
+        log("录制启动 recording=%s" % self.recording)
+        log("通道 钩子=%s 原始输入=%s 轮询线程=%s 错误=%s" % (
+            cap.hook_ok, self._raw_registered,
+            bool(cap._poll_thread and cap._poll_thread.is_alive()),
+            "；".join(cap.errors) or "无"))
+        own = self._selftest_own_point()
+        log("自窗口注入点 %s（应被过滤，不计入步骤）" % (own,))
+        log("桌面注入点 %s（没有则为 None，只做通道校验）" % (point,))
+
+        def inject():
+            if not self.recording:
+                log("录制未启动，跳过注入")
+                return
+            if own is not None:
+                # 先点自己窗口：安全，且能证明三路采集真的看到了 OS 级点击
+                _selftest_click(own[0], own[1])
+                time.sleep(0.12)
+                _selftest_click(own[0] + 45, own[1])
+            if point is not None:
+                time.sleep(0.12)
+                _selftest_click(point[0], point[1])
+                time.sleep(0.12)
+                _selftest_click(point[0] + 40, point[1])
+
+        def finish():
+            events = self._capture.total_events()
+            log("事件统计 " + self._capture.summary())
+            rows = self.step_table.rowCount()
+            log("录制到 %d 步" % rows)
+            for r in range(rows):
+                log("  第 %d 步 " % (r + 1) + " | ".join(
+                    self.step_table.item(r, c).text() if self.step_table.item(r, c) else ""
+                    for c in range(self.step_table.columnCount())))
+            self.toggle_recording(ask_save=False)
+            if events <= 0:
+                verdict = "失败：三路都没收到点击，请用管理员身份运行后重试"
+            elif point is not None and rows <= 0:
+                verdict = "失败：通道收到了点击但一步没落表，请把本日志反馈给作者"
+            else:
+                verdict = "通过：录制通道工作正常（事件 %d，步骤 %d）" % (events, rows)
+                if point is None:
+                    verdict += "；桌面被窗口铺满，桌面点击校验已跳过"
+            log("结论 " + verdict)
+            log("日志 " + path)
+            if saved_cursor is not None:
+                _user32.SetCursorPos(saved_cursor[0], saved_cursor[1])
+            self._closing = True
+            self.close()
+            QApplication.quit()
+
+        QTimer.singleShot(700, inject)
+        QTimer.singleShot(2400, finish)
+
+    def _selftest_own_point(self):
+        """自己窗口（录制悬浮条）中心的物理像素坐标，点它绝对安全。"""
+        rect = wintypes.RECT()
+        hwnd = wintypes.HWND(int(self.winId()))
+        if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        return ((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+
+    def _selftest_desktop_point(self):
+        """在桌面右下角区域找一点，其根窗口是桌面本体（点它不会打开任何东西）。"""
+        w, h = _user32.GetSystemMetrics(0), _user32.GetSystemMetrics(1)
+        for x, y in ((w - 160, h - 220), (w - 200, h - 300), (w // 2, h - 260),
+                     (w - 300, h - 200), (w - 120, h - 320)):
+            root = root_window_at(x, y)
+            if not root:
+                continue
+            if _window_class(root) in ("Progman", "WorkerW", "SysListView32"):
+                return x, y
+        return None
+
 
 def main():
     app = QApplication(sys.argv)
@@ -1988,6 +2540,10 @@ def main():
     app.setWindowIcon(QIcon(":/app.ico"))
     win = MainWindow()
     win.show()
+    if "--selftest" in sys.argv:
+        # 无人值守自检：验证三路录制通道，结果见 selftest.log
+        win.run_selftest()
+        sys.exit(app.exec())
     win.fade_in()
     sys.exit(app.exec())
 
