@@ -249,6 +249,30 @@ def is_elevated(pid=0):
             _kernel32.CloseHandle(handle)
 
 
+def relaunch_elevated(keep_args=True):
+    """以管理员身份重启自己；成功返回 True（调用方应立刻退出当前进程）。
+
+    游戏若由启动器以管理员身份拉起（王者荣耀世界、WeGame 等），普通权限进程
+    的鼠标钩子和 GetAsyncKeyState 会被 UIPI 一起掐掉——表现就是只录到第一下
+    点击，之后计数器再也不动。同权限运行是唯一根治办法。
+    """
+    try:
+        if getattr(sys, "frozen", False):
+            exe = sys.executable
+            args = sys.argv[1:] if keep_args else []
+            workdir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            exe = sys.executable
+            args = sys.argv if keep_args else sys.argv[:1]
+            workdir = os.path.dirname(os.path.abspath(__file__))
+        params = " ".join(f'"{a}"' for a in args)
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", exe, params or None, workdir, 1)
+    except OSError:
+        return False
+    return rc > 32              # ShellExecuteW 返回值 > 32 表示成功
+
+
 def process_path(pid):
     """进程可执行文件路径；取不到返回空串。"""
     if not pid:
@@ -812,7 +836,7 @@ class PromptDialog(QDialog):
 class AboutDialog(QDialog):
     """关于卡片：Logo、版本、作者署名与开源地址。"""
 
-    VERSION = "1.1.1"
+    VERSION = "1.1.2"
 
     def __init__(self, parent):
         super().__init__(parent)
@@ -1036,10 +1060,21 @@ class MouseCapture:
         vks = ((mouse.Button.left, 0x01), (mouse.Button.right, 0x02),
                (mouse.Button.middle, 0x04))
         prev = {vk: False for _, vk in vks}
+        down_since = {vk: 0.0 for _, vk in vks}
         try:
             while not self._stop.is_set():
+                now = time.perf_counter()
                 for btn, vk in vks:
                     down = bool(_user32.GetAsyncKeyState(vk) & 0x8000)
+                    if down and not prev[vk]:
+                        down_since[vk] = now
+                    elif down and now - down_since[vk] > 3.0:
+                        # 抬起事件被游戏/反作弊吞掉时状态会一直停在“按下”，
+                        # 不重置就再也收不到下一次点击（表现：只录到 1 步）
+                        prev[vk] = False
+                        down_since[vk] = now
+                        self.trace_line("按键状态卡住，重置边沿")
+                        continue
                     if down != prev[vk]:
                         prev[vk] = down
                         pos = cursor_pos()
@@ -1132,6 +1167,10 @@ class MainWindow(QWidget):
         self._diag_last = 0.0
         self._uipi_warned = False
         self._uipi_last = 0.0
+        self._uipi_note = None
+        # 本轮录制：落在本程序窗口上被过滤掉的点击数（区分“没收到”与“被过滤”）
+        self._rec_filtered = 0
+        self._rec_kept = 0
         self._drag_pos = None
         self._closing = False
         self._minimizing = False
@@ -1838,6 +1877,9 @@ class MainWindow(QWidget):
         self.recording = True
         self._uipi_warned = False
         self._uipi_last = 0.0
+        self._uipi_note = None
+        self._rec_filtered = 0
+        self._rec_kept = 0
         self._diag_last = 0.0
         self._capture = MouseCapture(self._on_capture_event)
         self._capture.start()
@@ -1889,6 +1931,18 @@ class MainWindow(QWidget):
             # 一个点击都没录到不清空旧存档，避免静默丢数据
             self._recording_empty_dialog()
             return
+        if self._uipi_note and self.step_table.rowCount() <= 1:
+            # 典型症状：只录到第一下，之后计数再也不动——前台游戏被提权了
+            dlg = PromptDialog(
+                self, "只录到 %d 步" % self.step_table.rowCount(),
+                "录制过程中前台切换到了 %s，它以管理员权限运行，"
+                "Windows 会屏蔽普通权限程序的鼠标事件，后面的点击收不到。\n\n"
+                "以管理员身份重启本程序后再录一次即可正常。"
+                % _short_exe(self._uipi_note["path"]),
+                prompt=False, confirm_text="以管理员身份重启")
+            if dlg.popup() == QDialog.Accepted:
+                self._restart_as_admin()
+                return
         # 自动填入：最后一次点击到停止录制之间的自然停顿作为循环间隔
         if self._last_record_t:
             pause = time.perf_counter() - self._last_record_t
@@ -1922,7 +1976,9 @@ class MainWindow(QWidget):
                 "请依次排查：\n"
                 "1. 点「停止录制」之外的游戏画面再试，别点在悬浮条上；\n"
                 "2. 游戏若以管理员身份运行（用启动器/平台启动常见），本程序也用管理员身份重开；\n"
-                "3. 全屏独占游戏先切「窗口化 / 无边框窗口」再录。"
+                "3. 全屏独占游戏先切「窗口化 / 无边框窗口」再录；\n"
+                "4. 带 ACE 等反作弊的游戏（如王者荣耀世界）会拦截模拟输入，"
+                "请以管理员身份运行本程序。"
                 % (head, stats, self._audit_text(fg)))
         else:
             message = (
@@ -1937,17 +1993,8 @@ class MainWindow(QWidget):
             self._restart_as_admin()
 
     def _restart_as_admin(self):
-        """同权限重启：回放要点击提权窗口（管理员权限的游戏）时必须如此。"""
-        try:
-            params = (" ".join(f'"{a}"' for a in sys.argv)
-                      if not getattr(sys, "frozen", False) else "")
-            rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, params or None,
-                os.path.dirname(os.path.abspath(sys.executable)), 1)
-        except OSError as exc:
-            QMessageBox.warning(self, "重启失败", f"无法以管理员身份重启：{exc}")
-            return
-        if rc > 32:                     # ShellExecuteW 返回值 > 32 表示成功
+        """同权限重启：游戏以管理员运行时必须如此，否则录不到也点不进。"""
+        if relaunch_elevated():
             self._closing = True
             self.stop_all()
             self.close()
@@ -1978,18 +2025,32 @@ class MainWindow(QWidget):
         if not self.recording:
             return
         rows = self.step_table.rowCount()
+        counts = self._capture.counts
         self.pill_count.setText(f"● 已录制 {rows} 步")
+        self.pill_hint.setToolTip("AutoClicker v" + AboutDialog.VERSION)
         if rows:
-            self.pill_hint.setText("已记录，点右侧按钮结束")
+            # 计数器卡住时这行立刻能区分“事件没进来”还是“进来了但被过滤”
+            text = "钩子%d 轮询%d 原始%d" % (
+                counts.get("hook", 0), counts.get("poll", 0),
+                counts.get("raw", 0))
+            if self._rec_filtered:
+                text += " · 过滤%d" % self._rec_filtered
+            self.pill_hint.setText(text)
             return
         elapsed = time.perf_counter() - self._record_t0
         if elapsed <= 1.5:
             return
-        counts = self._capture.counts
+        if self._rec_filtered:
+            self.pill_hint.setText(
+                "点击落在本程序窗口 · 过滤%d，点游戏画面" % self._rec_filtered)
+            return
         dead = self._capture.dead
         if dead:
             self.pill_hint.setText(
                 f"采集通道断开（{self._capture.summary()}），点停止看诊断")
+        elif self._uipi_note:
+            # 前台是提权程序：钩子与 GetAsyncKeyState 都会被 UIPI 掐掉
+            self.pill_hint.setText("前台程序权限更高 · 以管理员身份重启才能录制")
         else:
             # 实时显示三路通道各收到多少事件：全是 0 说明系统没把点击送过来
             self.pill_hint.setText(
@@ -2005,7 +2066,11 @@ class MainWindow(QWidget):
             _short_exe(info["path"]), info["class"] or "?", info["pid"], flag)
 
     def _uipi_check(self):
-        """前台窗口比本程序权限高时，Windows 会摘掉鼠标钩子——当场提醒。"""
+        """前台窗口比本程序权限高时，Windows 会摘掉鼠标钩子——当场记下来。
+
+        这里刻意不弹窗：录制途中弹模态框会抢焦点、盖住游戏画面，甚至把后续
+        点击全吃在自己窗口上，比不提示更糟。提示只落在悬浮条第二行。
+        """
         now = time.perf_counter()
         if self._uipi_warned or now - self._uipi_last < 0.5:
             return
@@ -2015,21 +2080,8 @@ class MainWindow(QWidget):
             return
         if info["elevated"] and is_elevated() is False:
             self._uipi_warned = True
+            self._uipi_note = info
             self._diag_write("检测到 UIPI：" + self._audit_text(info))
-            self.pill_hint.setText("游戏权限更高，可能录不到点击")
-            # 不在定时器回调里开模态框：排到事件循环下一轮
-            QTimer.singleShot(0, lambda: self._show_uipi_dialog(info))
-
-    def _show_uipi_dialog(self, info):
-        dlg = PromptDialog(
-            self, "游戏权限更高",
-            "前台窗口 %s 以管理员权限运行，Windows 会屏蔽本程序的鼠标钩子，"
-            "点击多半录不到。\n\n要以管理员身份重新启动本程序吗？"
-            "（会先结束当前录制）" % _short_exe(info["path"]),
-            prompt=False, confirm_text="以管理员身份重启")
-        if dlg.popup() == QDialog.Accepted:
-            self._stop_recording(ask_save=False)
-            self._restart_as_admin()
 
     def _diag_open(self):
         if not self._diag or self._diag_path:
@@ -2081,6 +2133,7 @@ class MainWindow(QWidget):
         # 三通道给的都是物理像素，直接落地存储，回放时也按物理像素还原
         x, y = int(x), int(y)
         if self._is_own_point(x, y):
+            self._rec_filtered += 1      # 点在自己窗口上：不算误报，要能看出来
             return
         if now is None:
             now = time.perf_counter()
@@ -2091,6 +2144,7 @@ class MainWindow(QWidget):
             dt = int((now - self._last_record_t) * 1000)
             table.item(last, 4).setText(str(max(dt, 10)))
         self._last_record_t = now
+        self._rec_kept += 1
         self._add_step_row(x, y, button, 1, 200)
 
     def _own_hwnds(self):
@@ -2797,6 +2851,12 @@ class MainWindow(QWidget):
 
 
 def main():
+    # 游戏若由启动器以管理员拉起，普通权限下钩子和 GetAsyncKeyState 都会被
+    # UIPI 掐掉（现象：只录到第一下点击）。默认直接以同权限重启一次。
+    if ("--selftest" not in sys.argv and "--no-elevate" not in sys.argv
+            and is_elevated() is False):
+        if relaunch_elevated():
+            return
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setWindowIcon(QIcon(":/app.ico"))
