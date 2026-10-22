@@ -135,6 +135,12 @@ python script/autoclicker_cli.py replay macro.json --loops 10        # 回放 10
 - **工作流适配**：宏放进了 `ScrollView`（`fillViewport` 撑满），小屏、横屏、分屏下整页可滚动而不会裁掉下面的控件；存档列表高度随屏高收缩，横屏也不会把设置挤出屏幕；
 - **限制**：系统级注入依赖无障碍权限，部分厂商系统（MIUI/EMUI/ColorOS 等）需要额外允许「后台弹出界面」与「自启动」；带反作弊的联网手游可能检测模拟点击，使用前请自行确认游戏规则。
 
+界面截图（Android 14 模拟器实跑：连点、录制 2 步、存档、回放、深色主题、横屏/小屏滚动）：
+
+| 连续点击 | 宏回放 | 录制中 | 横屏滚动 |
+| --- | --- | --- | --- |
+| ![连续点击](android/screenshots/01-continuous.png) | ![宏回放](android/screenshots/02-macro-saved.png) | ![录制中](android/screenshots/03-recording.png) | ![横屏](android/screenshots/05-landscape-scroll.png) |
+
 源码、构建命令与文件清单见 [`android/README.md`](android/README.md)。
 
 ## 宏存档格式

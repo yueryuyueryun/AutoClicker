@@ -4,6 +4,22 @@
 
 当前版本 **1.1.2**（`versionCode 2`），与电脑版 `v1.1.2` 同版本号，界面、配色、页转与宏结构都按电脑版对齐。本目录已附可直接安装的 [`AutoClicker.apk`](AutoClicker.apk)（debug 签名，1.5 MB）。
 
+## 界面一览
+
+| 连续点击 | 宏回放（已存 2 步） |
+| --- | --- |
+| ![连续点击](screenshots/01-continuous.png) | ![宏回放](screenshots/02-macro-saved.png) |
+
+| 录制中（悬浮层，点击会穿透） | 深色主题 |
+| --- | --- |
+| ![录制中](screenshots/03-recording.png) | ![深色主题](screenshots/04-dark.png) |
+
+| 横屏（整页滚动，不再裁切） | 小屏 600×960 |
+| --- | --- |
+| ![横屏](screenshots/05-landscape-scroll.png) | ![小屏](screenshots/06-small-screen.png) |
+
+以上截图均取自 Android 14 模拟器（Pixel 5，1080×2340 @440dpi）实跑：安装 → 开无障碍/悬浮窗 → 选点连点（胶囊条正常，完成 1 次）→ 录制 2 步 → 新建存档（`回放 1 · 2 步 · 0.7s`）→ 回放 1 次 → 切深色主题；横屏与小屏用 `wm size` 覆盖验证滚动适配。
+
 ## 功能清单
 
 - **单界面 + 分段切换**：「连续点击 / 宏回放」两页用分段控件切换，页间为 260ms `InOutCubic` 水平平移，与电脑版 `_slide_panels` 同款；卡片圆角、浅色/深色配色沿用同一套常量。
