@@ -37,7 +37,7 @@
 | ---- | ---- | ---- | -------- |
 | **Windows 图形版** | [`windows/`](windows/) | PySide6 桌面应用，打包为免安装 exe | 日常使用，功能最全 |
 | **命令行脚本版** | [`script/`](script/README.md) | 纯 Python 单文件，无 GUI | 服务器/远程桌面/自动化脚本串联 |
-| **Android 版** | [`android/`](android/README.md) | Kotlin 无障碍服务 App 工程 | 手机端连点与宏回放，无需 root |
+| **Android 版** | [`android/`](android/README.md) | Kotlin 无障碍服务 App（已附 `android/AutoClicker.apk`） | 手机端连点与宏回放，无需 root |
 
 三个版本共用同一套宏存档 JSON 结构（`steps` / `gap` / `loops`），录制的存档可跨版本互换回放。
 
@@ -119,10 +119,23 @@ python script/autoclicker_cli.py replay macro.json --loops 10        # 回放 10
 
 ### Android 版
 
-基于无障碍服务（`AccessibilityService.dispatchGesture`）注入点击手势，**无需 root**。
-用 Android Studio 打开 `android/` 目录编译安装后：开启无障碍服务 → 授予悬浮窗权限 → 悬浮控制条即可连点或回放宏。
+基于无障碍服务（`AccessibilityService.dispatchGesture`）注入点击手势，**无需 root**。仓库已附签好的安装包 [`android/AutoClicker.apk`](android/AutoClicker.apk)（v1.1.2，`minSdk 24` / `targetSdk 34`，兼容 Android 7.0 及以上），拷到手机点开即可安装；也可用 Android Studio 打开 `android/` 目录自行编译。
 
-详见 [`android/README.md`](android/README.md)。
+装好后的三步：
+
+1. **开启无障碍**：设置 → 无障碍 → 已下载的服务 → AutoClicker → 打开（首次进 App 顶部会有「授权」按钮直达该页面）；
+2. **授予悬浮窗**：允许显示在其他应用上层，否则连点/录制时悬浮胶囊弹不出来；
+3. **点「开始」**：App 退到后台，屏幕边缘出现悬浮胶囊——拖到不挡视图的位置，点它开始连点或进入宏回放。
+
+与电脑版对齐的能力与差异：
+
+- **同一套宏结构**：`steps / gap / loops` 与 Windows、命令行版完全一致，手机录的宏可以在电脑上回放，反之亦然（坐标记的是各自屏幕的物理像素，跨设备回放请自行确认分辨率是否接近）；
+- **单界面 + 悬浮胶囊**：主界面用分段切换「连续点击 / 宏回放」，开始后收缩为可拖动的悬浮胶囊，页转与配色都和电脑版同款；
+- **存档与循环设置**：可新建 / 删除 / 选择多个宏存档，每轮回放之间可设循环间隔（秒）与循环次数（0 = 无限）；
+- **工作流适配**：宏放进了 `ScrollView`（`fillViewport` 撑满），小屏、横屏、分屏下整页可滚动而不会裁掉下面的控件；存档列表高度随屏高收缩，横屏也不会把设置挤出屏幕；
+- **限制**：系统级注入依赖无障碍权限，部分厂商系统（MIUI/EMUI/ColorOS 等）需要额外允许「后台弹出界面」与「自启动」；带反作弊的联网手游可能检测模拟点击，使用前请自行确认游戏规则。
+
+源码、构建命令与文件清单见 [`android/README.md`](android/README.md)。
 
 ## 宏存档格式
 
@@ -168,7 +181,7 @@ python -m PyInstaller --distpath dist AutoClicker.spec
 .
 ├─ windows/                                   Windows 图形版（源码 / 图标 / 打包配置 / 截图）
 ├─ script/                                    命令行脚本版（纯 Python）
-├─ android/                                   Android 无障碍服务 App 工程（Kotlin）
+├─ android/                                   Android 无障碍服务 App 工程（Kotlin，附 AutoClicker.apk）
 ├─ LICENSE                                    MIT 开源协议
 └─ README.md                                  本文件
 ```

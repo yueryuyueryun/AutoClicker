@@ -32,6 +32,8 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var card: LinearLayout
     private lateinit var pageHost: FrameLayout
+    private lateinit var pageCont: ScrollView
+    private lateinit var pageMacro: ScrollView
     private lateinit var panelCont: LinearLayout
     private lateinit var panelMacro: LinearLayout
     private lateinit var modeSeg: SegView
@@ -130,10 +132,15 @@ class MainActivity : Activity() {
         pageHost = FrameLayout(this).apply { clipChildren = true }
         panelCont = buildContinuousPanel()
         panelMacro = buildMacroPanel()
-        pageHost.addView(panelCont, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        pageHost.addView(panelMacro, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
-        panelMacro.visibility = if (mode == 1) View.VISIBLE else View.GONE
-        panelCont.visibility = if (mode == 1) View.GONE else View.VISIBLE
+        // 小屏 / 分屏 / 横屏时内容可能高过可视区：每页套一层可滚动容器，
+        // 高度够时靠 fillViewport 撑满（保留电脑版那种“内容靠上、底部留白”），
+        // 不够时整页滚动，而不是把下面的控件裁掉。
+        pageCont = pageScroll(panelCont)
+        pageMacro = pageScroll(panelMacro)
+        pageHost.addView(pageCont, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        pageHost.addView(pageMacro, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        pageMacro.visibility = if (mode == 1) View.VISIBLE else View.GONE
+        pageCont.visibility = if (mode == 1) View.GONE else View.VISIBLE
         addView(card, pageHost, weight = 1f, bottomMargin = dp(this, 14f))
 
         startBtn = pillButton(this, "开始连点") { toggleStart() }
@@ -294,7 +301,7 @@ class MainActivity : Activity() {
                 dp(this@MainActivity, 5f), dp(this@MainActivity, 5f))
         }
         scroll.addView(slotBox)
-        panel.addView(scroll, ViewGroup.LayoutParams.MATCH_PARENT, dp(this, 190f))
+        panel.addView(scroll, ViewGroup.LayoutParams.MATCH_PARENT, slotListHeight())
         panel.addView(space(dp(this, 12f)))
 
         panel.addView(spinRow("循环间隔", true, prefs.getString("gap", "0.5") ?: "0.5", "秒") { v, edit ->
@@ -371,8 +378,8 @@ class MainActivity : Activity() {
         ClickerService.instance?.setMode(i == 1)
         mode = i
         prefs.edit().putInt("mode", i).apply()
-        val old = if (i == 1) panelCont else panelMacro
-        val new = if (i == 1) panelMacro else panelCont
+        val old = if (i == 1) pageCont else pageMacro
+        val new = if (i == 1) pageMacro else pageCont
         slidePanels(old, new, if (i == 1) 1 else -1)
         syncStart()
     }
@@ -734,6 +741,27 @@ class MainActivity : Activity() {
         View(this).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h, weight)
         }
+
+    // 单页滚动容器：fillViewport 让子页在空间富余时仍占满高度（底部 weight 留白
+    // 照旧生效），空间不足时改为滚动，横屏 / 小屏 / 分屏都不会裁掉控件。
+    private fun pageScroll(content: View): ScrollView =
+        ScrollView(this).apply {
+            isFillViewport = true
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            clipToPadding = false
+            addView(
+                content,
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+    // 存档列表高度随屏高收缩，避免横屏或矮屏上把下面的循环设置挤出屏幕
+    private fun slotListHeight(): Int {
+        val byScreen = (resources.displayMetrics.heightPixels * 0.28f).toInt()
+        return minOf(dp(this, 190f), byScreen).coerceAtLeast(dp(this, 110f))
+    }
 
     private fun isAccessibilityEnabled(): Boolean {
         val am = getSystemService(Context.ACCESSIBILITY_SERVICE) as android.view.accessibility.AccessibilityManager

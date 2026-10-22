@@ -298,7 +298,7 @@ class OverlayController(
         val root = FrameLayout(ctx)
         root.setBackgroundColor(Color.argb(28, 91, 124, 250))
         val hint = TextView(ctx).apply {
-            text = "录制中 · 点击屏幕记录触点"
+            text = "录制中 · 点击屏幕即记录（会穿透给下层应用）"
             textSize = 13f
             setTextColor(Theme.pal.text)
             background = solid(ctx, Theme.pal.card, 12f, Theme.pal.cardBorder)
